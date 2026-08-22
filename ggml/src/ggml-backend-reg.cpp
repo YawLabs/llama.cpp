@@ -62,6 +62,10 @@
 #include "ggml-hexagon.h"
 #endif
 
+#ifdef GGML_USE_QNN
+#include "ggml-qnn.h"
+#endif
+
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
@@ -152,6 +156,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_HEXAGON
         register_backend(ggml_backend_hexagon_reg());
+#endif
+#ifdef GGML_USE_QNN
+        register_backend(ggml_backend_qnn_reg());
 #endif
 #ifdef GGML_USE_CANN
         register_backend(ggml_backend_cann_reg());
@@ -582,6 +589,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("virtgpu", silent, dir_path);
     ggml_backend_load_best("opencl", silent, dir_path);
     ggml_backend_load_best("hexagon", silent, dir_path);
+    ggml_backend_load_best("qnn", silent, dir_path);
     ggml_backend_load_best("musa", silent, dir_path);
     ggml_backend_load_best("openvino", silent, dir_path);
     ggml_backend_load_best("cpu", silent, dir_path);
