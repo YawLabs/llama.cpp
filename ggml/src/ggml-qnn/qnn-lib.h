@@ -6,6 +6,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include "qnn-mem.h"
+
 #include <QnnInterface.h>
 
 #include <mutex>
@@ -23,6 +25,18 @@ struct ggml_qnn_graph {
     // weights baked into the graph at finalize, see ggml_qnn_weights_static
     Qnn_Tensor_t weights = {};
     bool weights_static = false;
+    // quantized weights are dequantized to fp16 on the host into these scratch buffers,
+    // then bound to the fp16 weight input on every execute
+    bool weight_quantized = false;
+    std::vector<float>       dequant_f32;
+    std::vector<ggml_fp16_t> dequant_f16;
+    // registered fastrpc shared memory for zero-remap graph IO (GGML_QNN_SHARED_MEM):
+    // one buffer per input and one for the output, bound as MEMHANDLE instead of RAW clientBuf
+    bool shared_mem = false;
+    std::vector<ggml_qnn_mem_buffer> mem_inputs;
+    ggml_qnn_mem_buffer              mem_output;
+    // a constant weight is copied into its shared buffer once, this is the src it holds
+    const void * weight_cached_ptr = nullptr;
     // backing storage for the dimension arrays referenced by the tensors
     std::vector<std::vector<uint32_t>> dims;
     bool warned = false;
@@ -37,8 +51,16 @@ struct ggml_qnn_session {
     Qnn_DeviceHandle_t  device_handle  = nullptr;
     Qnn_ContextHandle_t context_handle = nullptr;
 
+    // HTP burst-clock power config, held for the session lifetime
+    uint32_t power_config_id  = 0;
+    bool     has_power_config = false;
+
     // guards the graph cache and the bind+execute sequence, backend instances share one session
     std::mutex mutex;
+
+    // a failed execute can poison the shared HTP context, so once it happens the whole session
+    // stops claiming ops and everything falls back to the CPU
+    bool degraded = false;
 
     std::unordered_map<std::string, ggml_qnn_graph> graphs;
 };

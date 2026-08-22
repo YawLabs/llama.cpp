@@ -200,9 +200,15 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
 
         case GGML_OP_MUL_MAT:
         {
-            // 2D F32/F16 weights with F32 activations, the HTP runs the math in FP16
-            if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
-                src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+            // 2D weights (F32, F16, or any quantized type with a dequantizer) times F32
+            // activations, the HTP runs the math in FP16
+            // experimental: quantized weights (dequantized to fp16 on the host) still fail on
+            // some large shapes, so they are opt-in until the mapping is fixed
+            static const bool quant_ok = getenv("GGML_QNN_QUANTIZED") != nullptr;
+            const bool src0_ok = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                                 (quant_ok && ggml_is_quantized(src0->type) &&
+                                  ggml_get_type_traits(src0->type)->to_float != NULL);
+            if (!src0_ok || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
                 return false;
             }
             if (!ggml_is_matrix(src0) || !ggml_is_matrix(src1)) {
@@ -222,7 +228,8 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
             if (ne0 < min_dim || ne1 < min_dim || ne10 < min_dim ||
                 ggml_nbytes(src0) > UINT32_MAX ||
                 ggml_nbytes(src1) > UINT32_MAX ||
-                ggml_nbytes(op)   > UINT32_MAX) {
+                ggml_nbytes(op)   > UINT32_MAX ||
+                src0->ne[0] * src0->ne[1] * 2 > UINT32_MAX) { // fp16 weight buffer on device
                 return false;
             }
             break;

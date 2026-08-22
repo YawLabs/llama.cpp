@@ -23,6 +23,8 @@ ggml_add_backend_library(${TARGET_NAME}
     ggml-qnn.cpp
     qnn-lib.cpp
     qnn-lib.h
+    qnn-mem.cpp
+    qnn-mem.h
     ../../include/ggml-qnn.h)
 
 target_include_directories(${TARGET_NAME} PRIVATE ${QNN_SDK_INCLUDE_DIR})
