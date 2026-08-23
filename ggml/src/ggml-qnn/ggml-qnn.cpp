@@ -202,11 +202,12 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
         {
             // 2D weights (F32, F16, or any quantized type with a dequantizer) times F32
             // activations, the HTP runs the math in FP16
-            // experimental: quantized weights (dequantized to fp16 on the host) still fail on
-            // some large shapes, so they are opt-in until the mapping is fixed
-            static const bool quant_ok = getenv("GGML_QNN_QUANTIZED") != nullptr;
+            // a quantized weight is claimable only when it can be baked statically (dequant once,
+            // correct) or the experimental per-execute dequant path is enabled
+            static const bool quant_ok  = getenv("GGML_QNN_QUANTIZED") != nullptr;
+            static const bool static_on = getenv("GGML_QNN_STATIC_WEIGHTS") != nullptr;
             const bool src0_ok = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
-                                 (quant_ok && ggml_is_quantized(src0->type) &&
+                                 ((quant_ok || static_on) && ggml_is_quantized(src0->type) &&
                                   ggml_get_type_traits(src0->type)->to_float != NULL);
             if (!src0_ok || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
                 return false;

@@ -62,6 +62,11 @@ struct ggml_qnn_session {
     // stops claiming ops and everything falls back to the CPU
     bool degraded = false;
 
+    // static-weight memory budget (bytes): only pin weights on the NPU up to this, the rest stay
+    // on the CPU. 0 means unlimited. GGML_QNN_STATIC_BUDGET_MB sets it.
+    size_t static_budget = 0;
+    size_t static_bytes  = 0;
+
     std::unordered_map<std::string, ggml_qnn_graph> graphs;
 };
 
