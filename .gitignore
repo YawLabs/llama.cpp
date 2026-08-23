@@ -153,3 +153,12 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# local benchmark / campaign scratch (never commit)
+/*.err
+/*.out
+/campaign*.md
+/run-model-campaign.sh
+/run-campaign-finish.sh
+/run-perf-ab*.sh
+/run-shm-perf.sh
