@@ -58,7 +58,9 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   HTP rejects or that wedge it are denylisted and permanently routed to the CPU.
 - Model weights are baked into their graphs once (dequantized to fp16 when quantized) in
   HTP-native layout, within a memory budget (default 2048 MB). Weights past the budget
-  stay on the CPU.
+  stay on the CPU. The first time a shape is seen it pays graph build + finalize + bake
+  (tens of ms to seconds per shape), so the first prompt is noticeably slower than
+  steady state - expected, not a hang.
 - Static-weight graphs pad the batch dimension to a bucket (default 512) so one graph
   and one baked weight serve every prompt length.
 - Calls that can hang the HTP run under a watchdog; a timeout degrades the whole backend
@@ -71,7 +73,8 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
 | `GGML_QNN_DISABLE` | unset | disable the backend entirely |
 | `GGML_QNN_MIN_DIM` | 32 | minimum matmul dimension to claim (smaller goes to the CPU) |
 | `GGML_QNN_STATIC_BUDGET_MB` | 2048 | cap on baked static-weight bytes, 0 = unlimited |
-| `GGML_QNN_NPAD` | 512 | batch-dim bucket floor for static graphs |
+| `GGML_QNN_NPAD` | 512 | batch-dim bucket floor for static graphs. This is the load-bearing knob for large models: graph execute hangs when a padded IO buffer crosses a runtime-dependent threshold (~1-1.5 MB measured), so keep `max(K, M) * NPAD * 4` bytes under ~1 MB - e.g. `GGML_QNN_NPAD=64` (with a matching `-ub 64`) for model-scale weights |
+| `GGML_QNN_NO_OPT` | unset | drop the finalize-optimization flag (matmul graphs; debugging lever) |
 | `GGML_QNN_NO_STATIC_WEIGHTS` | unset | disable static weight baking |
 | `GGML_QNN_DENYLIST` | unset | file that persists failed shapes across runs |
 | `GGML_QNN_NO_PREVALIDATE` | unset | skip the test-execute during shape validation |
