@@ -26,7 +26,7 @@ but per-op scheduling and IO copies eat the advantage on real models. The practi
 today is (a) the robustness machinery (load-time shape prevalidation, persistent
 failed-shape denylist, watchdog with clean CPU fallback), (b) the measured evidence that
 compile-once/load-fast AOT context binaries are the right next step (a serialized context
-reloads ~8x faster than a fresh finalize), and (c) a bounded static-weight path that bakes
+reloads ~8x faster than a fresh finalize: ~5 ms vs ~41 ms measured), and (c) a bounded static-weight path that bakes
 quantized weights to fp16 on the NPU within a memory budget.
 
 ## Requirements
@@ -84,10 +84,10 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
 ## Benchmarking notes
 
 - On Snapdragon X Elite the all-physical-cores thread default costs 2-5x on token
-  generation and makes results noisy (44% vs 7% relative stddev measured), on AC power
-  and battery alike - decode's per-token threadpool barriers pay for oversubscription,
-  prefill does not. Use about half the cores (`-t 6` on the 12-core X1E80100) for any
-  decode measurement. Battery core parking amplifies the effect further.
+  generation and makes results noisy (44% vs 7% relative stddev, measured on AC power) -
+  decode's per-token threadpool barriers pay for oversubscription, prefill shows no
+  comparable collapse. Use about half the cores (`-t 6` on the 12-core X1E80100) for any
+  decode measurement. Battery behavior has not been cleanly measured and may be worse.
 - The NPU is a single-client device: never run two NPU-using processes at once, the HTP
   can wedge and need a device reset.
 - Memory is unified (CPU, GPU and NPU share the same LPDDR5x pool and bandwidth); budget

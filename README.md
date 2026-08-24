@@ -18,14 +18,15 @@ Developed and measured on a Snapdragon X Elite (X1E80100, HTP v73).
 Measured on that machine:
 
 - **6-11 TFLOP/s fp16** single-matmul kernel throughput with burst clocks + static-baked
-  weights (vs ~0.17 TFLOP/s naive per-op execution on the same hardware - the two changes
-  are a 2-2.5x DCVS TURBO power config and baking weights once in HTP-native layout, up to
-  64x on deep-K shapes)
+  weights (vs ~0.17 TFLOP/s naive per-op execution on the same hardware - the two changes,
+  a DCVS TURBO power config worth 2-2.5x and baking weights once in HTP-native layout, are
+  together worth up to 64x on deep-K shapes)
 - **45/45** `test-backend-ops` MUL_MAT correctness (F32/F16), clean process exit
 - **No hangs on real models**: every shape is built, finalized and test-executed before the
-  backend claims it; shapes the HTP rejects or that wedge it land in a persistent denylist
-  and run on the CPU instead. Configurations that previously wedged the machine now complete
-  with graceful fallback
+  backend claims it; shapes the HTP rejects or that wedge it land in an in-process denylist
+  (persisted across runs when `GGML_QNN_DENYLIST` points at a file) and run on the CPU
+  instead. Configurations that previously wedged the machine now complete with graceful
+  fallback
 - Quantized weights (Q4/Q5/...) enter the NPU path by being dequantized to fp16 once at bake
   time, within a memory budget (default 2048 MB); one padded graph per weight serves every
   prompt length
