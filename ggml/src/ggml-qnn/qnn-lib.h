@@ -36,8 +36,9 @@ struct ggml_qnn_graph {
     size_t pending_static_bytes = 0;
     // build declined by policy (budget full, gated path), not a shape the HTP rejected
     bool policy_reject = false;
-    // host fp16 staging for a quantized static bake, freed after finalize
-    std::vector<ggml_fp16_t> bake_f16;
+    // graph-owned staging for the static bake (weight bytes, or fp16 when the source is
+    // quantized), so a wedged finalize never points into model memory. freed after finalize
+    std::vector<uint8_t> bake;
     bool weight_quantized = false;
     // graph-owned IO buffers: every execute copies in/out of these instead of
     // binding ggml buffers directly, so an abandoned (timed out) execute can

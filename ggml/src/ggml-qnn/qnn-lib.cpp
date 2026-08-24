@@ -14,6 +14,7 @@
 #include <HTP/QnnHtpDevice.h>
 #include <HTP/QnnHtpPerfInfrastructure.h>
 
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
@@ -105,6 +106,10 @@ static void ggml_qnn_log_callback(const char * fmt, QnnLog_Level_t level, uint64
     }
     GGML_UNUSED(timestamp);
 }
+
+// device memory committed to baked static weights, process-global: a kept degraded session
+// still has its weights mapped on the NPU, so a successor session must not re-spend that budget
+static std::atomic<size_t> ggml_qnn_static_committed{0};
 
 //
 // timed calls
@@ -341,6 +346,8 @@ void ggml_qnn_session_free(ggml_qnn_session * sess) {
     }
     if (sess->context_handle) {
         sess->iface.contextFree(sess->context_handle, nullptr);
+        // the freed context returns its baked-weight device memory
+        ggml_qnn_static_committed -= sess->static_bytes;
     }
     if (sess->has_power_config) {
         QnnDevice_Infrastructure_t infra = nullptr;
@@ -487,6 +494,7 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
 
     const uint32_t Nb = g.n_pad;
     if ((uint64_t) K * Nb * sizeof(float) > UINT32_MAX || (uint64_t) M * Nb * sizeof(float) > UINT32_MAX) {
+        g.policy_reject = true; // local arithmetic, not an HTP verdict - keep it off the denylist
         return false;
     }
 
@@ -494,7 +502,7 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
     // the budget is charged only after finalize succeeds
     if (g.weights_static && sess->static_budget) {
         const size_t need = ggml_qnn_static_bytes(src0);
-        if (sess->static_bytes + need > sess->static_budget) {
+        if (ggml_qnn_static_committed.load() + need > sess->static_budget) {
             g.policy_reject = true;
             return false;
         }
@@ -515,19 +523,17 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
 
     Qnn_Tensor_t & w = g.weights_static ? g.weights : g.inputs[1];
     if (g.weights_static) {
-        // bake the weight once, dequantizing a quantized source to fp16 first. the fp16
-        // staging is freed after finalize, QNN owns the converted copy from then on
-        void *   wdata = src0->data;
-        uint32_t wsize = (uint32_t) ggml_nbytes(src0);
+        // bake the weight once from graph-owned staging, dequantizing a quantized source to
+        // fp16 first. QNN owns the converted copy from finalize on and the staging is freed;
+        // a wedged finalize leaks the staging instead of pointing into model memory
         if (g.weight_quantized) {
-            const int64_t n = ggml_nelements(src0);
-            g.bake_f16.resize((size_t) n);
-            ggml_qnn_dequant_f16(src0, g.bake_f16.data());
-            wdata = g.bake_f16.data();
-            wsize = (uint32_t) (n * sizeof(ggml_fp16_t));
+            g.bake.resize((size_t) ggml_nelements(src0) * sizeof(ggml_fp16_t));
+            ggml_qnn_dequant_f16(src0, (ggml_fp16_t *) g.bake.data());
+        } else {
+            g.bake.assign((const uint8_t *) src0->data, (const uint8_t *) src0->data + ggml_nbytes(src0));
         }
         if (!ggml_qnn_tensor_init(sess, g, w, "in1", QNN_TENSOR_TYPE_STATIC, {M, K}, ggml_qnn_weight_dtype(src0->type),
-                                  wdata, wsize)) {
+                                  g.bake.data(), (uint32_t) g.bake.size())) {
             return false;
         }
     } else {
@@ -575,14 +581,18 @@ static std::string ggml_qnn_shape_key(const ggml_tensor * node) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
 
-    // static matmul graphs use the padded batch dim, so every N in a bucket shares one graph
-    const int64_t ne11 = ggml_qnn_weights_static(node) ? (int64_t) ggml_qnn_pad_n((uint32_t) src1->ne[1]) : src1->ne[1];
+    // static matmul graphs use the padded batch dim, so every N in a bucket shares one graph.
+    // the variant tag matters: static-baked and dynamic-weight graphs are different HTP
+    // programs with different finalize outcomes, a denylist entry must only ban the one that failed
+    const bool is_static = ggml_qnn_weights_static(node);
+    const int64_t ne11 = is_static ? (int64_t) ggml_qnn_pad_n((uint32_t) src1->ne[1]) : src1->ne[1];
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "%s_%s_%s_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+    snprintf(buf, sizeof(buf), "%s_%s_%s_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "%s",
              ggml_op_name(node->op), ggml_type_name(src0->type), ggml_type_name(src1->type),
              src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-             src1->ne[0], ne11, src1->ne[2], src1->ne[3]);
+             src1->ne[0], ne11, src1->ne[2], src1->ne[3],
+             is_static ? "_s" : "_dyn");
     return buf;
 }
 
@@ -779,7 +789,7 @@ static void ggml_qnn_graph_release_buffers(ggml_qnn_session * sess, ggml_qnn_gra
     g.mem_inputs.clear();
     g.host_inputs.clear();
     g.host_output.clear();
-    std::vector<ggml_fp16_t>().swap(g.bake_f16);
+    std::vector<uint8_t>().swap(g.bake);
 }
 
 //
@@ -794,13 +804,15 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
         return &it->second;
     }
 
+    // the graph lives in the cache from the start: map nodes are address-stable, so every
+    // pointer a timed call captures into it stays valid even after a timeout abandons the call
+    ggml_qnn_graph & g = sess->graphs.emplace(key, ggml_qnn_graph()).first->second;
+
     // a shape that failed before (this run or, with GGML_QNN_DENYLIST, an earlier one) is
     // never built again: no doomed 1-13s finalize per start, no second wedge on a bad shape
     const std::string shape_key = ggml_qnn_shape_key(node);
     if (ggml_qnn_denylisted(shape_key)) {
-        ggml_qnn_graph negative;
-        auto res = sess->graphs.emplace(key, std::move(negative));
-        return &res.first->second;
+        return &g;
     }
 
     // burst clocks are applied on first real use, so merely enumerating the device
@@ -811,8 +823,6 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
             ggml_qnn_set_burst_mode(sess);
         }
     }
-
-    ggml_qnn_graph g;
 
     // HTP has no native FP32 matmul, request FP16 precision so those graphs convert internally,
     // elementwise ops stay FP32 to keep full precision
@@ -886,8 +896,9 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
 
     if (ok && g.weights_static) {
         sess->static_bytes += g.pending_static_bytes;
+        ggml_qnn_static_committed += g.pending_static_bytes;
         // QNN owns the HTP-layout copy from finalize on, drop the host staging
-        std::vector<ggml_fp16_t>().swap(g.bake_f16);
+        std::vector<uint8_t>().swap(g.bake);
     }
 
     if (aot_test && ok) {
@@ -938,8 +949,7 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
         g.handle = nullptr;
     }
 
-    auto res = sess->graphs.emplace(std::move(key), std::move(g));
-    return &res.first->second;
+    return &g;
 }
 
 //

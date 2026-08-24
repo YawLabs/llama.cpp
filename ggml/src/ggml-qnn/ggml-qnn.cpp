@@ -12,18 +12,27 @@
 // backend instances share one refcounted session, freed when the last instance is freed:
 // a session still alive at process exit crashes inside QnnHtp (ExitProcess kills its worker
 // threads before DLL detach; static destructors, atexit, DLL detach - all tried), so only
-// mid-process free is safe. a degraded session is deliberately leaked instead, an abandoned
-// watchdog call may still be touching it from inside the driver
+// mid-process free is safe. a degraded session is kept instead of freed: an abandoned
+// watchdog call may still touch it from inside the driver, re-initializing against a wedged
+// HTP could hang unwatchdogged in deviceCreate, and it keeps init_backend succeeding (it
+// claims no ops, so everything falls back to the CPU) instead of failing llama_new_context
 static std::mutex          ggml_qnn_session_mutex;
 static ggml_qnn_session *  ggml_qnn_session_ptr    = nullptr;
 static int                 ggml_qnn_session_refs   = 0;
+static bool                ggml_qnn_session_worked = false;
 static bool                ggml_qnn_session_failed = false;
 
 static ggml_qnn_session * ggml_backend_qnn_session_acquire(bool add_ref) {
     std::lock_guard<std::mutex> lock(ggml_qnn_session_mutex);
     if (!ggml_qnn_session_ptr && !ggml_qnn_session_failed) {
-        ggml_qnn_session_ptr    = ggml_qnn_session_init();
-        ggml_qnn_session_failed = ggml_qnn_session_ptr == nullptr;
+        ggml_qnn_session_ptr = ggml_qnn_session_init();
+        if (ggml_qnn_session_ptr) {
+            ggml_qnn_session_worked = true;
+        } else if (!ggml_qnn_session_worked) {
+            // no HTP on this machine, stop probing. a failure after a successful run is
+            // not latched, so a transient error can be retried on the next acquire
+            ggml_qnn_session_failed = true;
+        }
     }
     if (ggml_qnn_session_ptr && add_ref) {
         ggml_qnn_session_refs++;
@@ -36,8 +45,7 @@ static void ggml_backend_qnn_session_release(void) {
     GGML_ASSERT(ggml_qnn_session_refs > 0);
     if (--ggml_qnn_session_refs == 0) {
         if (ggml_qnn_session_ptr->degraded) {
-            GGML_LOG_WARN("ggml-qnn: leaking degraded session, the HTP may hold a stuck call\n");
-            ggml_qnn_session_ptr = nullptr; // next acquire starts fresh
+            GGML_LOG_WARN("ggml-qnn: keeping degraded session, NPU disabled for this process\n");
             return;
         }
         ggml_qnn_session_free(ggml_qnn_session_ptr);
