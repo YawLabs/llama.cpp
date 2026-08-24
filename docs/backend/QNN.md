@@ -83,9 +83,11 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
 
 ## Benchmarking notes
 
-- On battery, Windows on ARM core parking and idle-state exit latency destroy
-  token-generation throughput at high thread counts regardless of backend. Use `-t 6`
-  (not the all-cores default) when benchmarking on battery, or plug in.
+- On Snapdragon X Elite the all-physical-cores thread default costs 2-5x on token
+  generation and makes results noisy (44% vs 7% relative stddev measured), on AC power
+  and battery alike - decode's per-token threadpool barriers pay for oversubscription,
+  prefill does not. Use about half the cores (`-t 6` on the 12-core X1E80100) for any
+  decode measurement. Battery core parking amplifies the effect further.
 - The NPU is a single-client device: never run two NPU-using processes at once, the HTP
   can wedge and need a device reset.
 - Memory is unified (CPU, GPU and NPU share the same LPDDR5x pool and bandwidth); budget
