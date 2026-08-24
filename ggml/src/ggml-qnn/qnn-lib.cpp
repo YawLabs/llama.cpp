@@ -14,9 +14,9 @@
 #include <HTP/QnnHtpDevice.h>
 #include <HTP/QnnHtpPerfInfrastructure.h>
 
-#include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -107,36 +107,75 @@ static void ggml_qnn_log_callback(const char * fmt, QnnLog_Level_t level, uint64
 }
 
 //
-// session
+// timed calls
 //
 
-typedef Qnn_ErrorHandle_t (*ggml_qnn_get_providers_fn_t)(const QnnInterface_t *** providers, uint32_t * n_providers);
+// graphFinalize / graphExecute can hang the HTP so the call never returns. they run on one
+// persistent worker thread with a timeout; on timeout the worker is abandoned (it stays
+// stuck in the driver) and the session degrades to the CPU. the session is then deliberately
+// leaked, so the stuck call can only ever touch memory that is still alive. the worker
+// deletes its own state when it exits (quit or found itself abandoned)
+struct ggml_qnn_call_worker {
+    std::mutex              m;
+    std::condition_variable cv;
+    std::function<Qnn_ErrorHandle_t()> job;
+    bool has_job  = false;
+    bool job_done = false;
+    bool lost     = false;
+    bool quit     = false;
+    Qnn_ErrorHandle_t result = QNN_SUCCESS;
+};
 
-// run a QNN call that can hang the HTP (graphFinalize / graphExecute) on a detached thread with a
-// timeout. some real-model shapes wedge the HTP so the call never returns; if it does not finish in
-// time the thread is abandoned (it stays stuck in the driver, but inference continues) and the caller
-// falls back to the CPU. returns true if the call completed, writing its result to *out.
-static bool ggml_qnn_call_timed(std::function<Qnn_ErrorHandle_t()> call, Qnn_ErrorHandle_t * out) {
-    static const int timeout_ms = getenv("GGML_QNN_TIMEOUT_MS") ? atoi(getenv("GGML_QNN_TIMEOUT_MS")) : 15000;
-    auto done = std::make_shared<std::atomic<bool>>(false);
-    auto res  = std::make_shared<Qnn_ErrorHandle_t>(QNN_SUCCESS);
-
-    std::thread([call = std::move(call), done, res]() {
-        Qnn_ErrorHandle_t e = call();
-        *res = e;
-        done->store(true, std::memory_order_release);
-    }).detach();
-
-    const auto start = std::chrono::steady_clock::now();
-    while (!done->load(std::memory_order_acquire)) {
-        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(timeout_ms)) {
-            return false;
+static void ggml_qnn_worker_loop(ggml_qnn_call_worker * w) {
+    std::unique_lock<std::mutex> lock(w->m);
+    for (;;) {
+        w->cv.wait(lock, [w] { return w->has_job || w->quit; });
+        if (w->quit) {
+            break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::function<Qnn_ErrorHandle_t()> job = std::move(w->job);
+        w->has_job = false;
+        lock.unlock();
+        Qnn_ErrorHandle_t r = job();
+        lock.lock();
+        w->result   = r;
+        w->job_done = true;
+        w->cv.notify_all();
+        if (w->lost) {
+            break;
+        }
     }
-    *out = *res;
+    lock.unlock();
+    delete w;
+}
+
+// returns true if the call completed, writing its result to *out. false means timeout
+static bool ggml_qnn_call_timed(ggml_qnn_session * sess, std::function<Qnn_ErrorHandle_t()> call, Qnn_ErrorHandle_t * out) {
+    static const int timeout_ms = getenv("GGML_QNN_TIMEOUT_MS") ? atoi(getenv("GGML_QNN_TIMEOUT_MS")) : 15000;
+
+    if (!sess->worker) {
+        sess->worker = new ggml_qnn_call_worker();
+        std::thread(ggml_qnn_worker_loop, sess->worker).detach();
+    }
+    ggml_qnn_call_worker * w = sess->worker;
+
+    std::unique_lock<std::mutex> lock(w->m);
+    w->job      = std::move(call);
+    w->has_job  = true;
+    w->job_done = false;
+    w->cv.notify_all();
+    if (!w->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [w] { return w->job_done; })) {
+        w->lost      = true;
+        sess->worker = nullptr; // abandoned, leaked on purpose
+        return false;
+    }
+    *out = w->result;
     return true;
 }
+
+//
+// power
+//
 
 // lock the HTP to TURBO clocks with DCVS disabled, otherwise it idles at low clocks and the
 // matmul runs an order of magnitude slower than the hardware is capable of
@@ -186,7 +225,17 @@ static void ggml_qnn_set_burst_mode(ggml_qnn_session * sess) {
     GGML_LOG_INFO("ggml-qnn: HTP locked to TURBO clocks (burst)\n");
 }
 
+//
+// session
+//
+
+typedef Qnn_ErrorHandle_t (*ggml_qnn_get_providers_fn_t)(const QnnInterface_t *** providers, uint32_t * n_providers);
+
 ggml_qnn_session * ggml_qnn_session_init(void) {
+    if (getenv("GGML_QNN_DISABLE")) {
+        GGML_LOG_INFO("ggml-qnn: disabled by GGML_QNN_DISABLE\n");
+        return nullptr;
+    }
     void * lib = ggml_qnn_load_htp_lib();
     if (!lib) {
         GGML_LOG_DEBUG("ggml-qnn: QnnHtp library not found, backend unavailable\n");
@@ -253,17 +302,15 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
 
     GGML_LOG_INFO("ggml-qnn: initialized Hexagon NPU (HTP)\n");
 
-    if (const char * mb = getenv("GGML_QNN_STATIC_BUDGET_MB")) {
-        sess->static_budget = (size_t) atoll(mb) * 1024 * 1024;
-        GGML_LOG_INFO("ggml-qnn: static-weight budget %s MB\n", mb);
+    // unlimited static pinning exhausts NPU mapped memory on full models, which can poison
+    // the context, so cap it by default
+    const char * mb = getenv("GGML_QNN_STATIC_BUDGET_MB");
+    sess->static_budget = (mb ? (size_t) atoll(mb) : 2048) * 1024 * 1024;
+    if (sess->static_budget) {
+        GGML_LOG_INFO("ggml-qnn: static-weight budget %zu MB\n", sess->static_budget / (1024 * 1024));
     }
 
-    // lock the NPU to high clocks unless explicitly disabled
-    if (!getenv("GGML_QNN_NO_BURST")) {
-        ggml_qnn_set_burst_mode(sess);
-    }
-
-    // probe fastrpc shared memory, the foundation for registered zero-remap graph IO
+    // probe fastrpc shared memory, used for registered graph IO buffers
     if (getenv("GGML_QNN_SHARED_MEM")) {
         if (!ggml_qnn_mem_self_test(&sess->iface, sess->context_handle)) {
             GGML_LOG_INFO("ggml-qnn: fastrpc shared memory not available on this device\n");
@@ -276,6 +323,13 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
 void ggml_qnn_session_free(ggml_qnn_session * sess) {
     if (!sess) {
         return;
+    }
+    if (sess->worker) {
+        // tell the idle worker to exit, it deletes its own state
+        std::lock_guard<std::mutex> lock(sess->worker->m);
+        sess->worker->quit = true;
+        sess->worker->cv.notify_all();
+        sess->worker = nullptr;
     }
     // deregister + free shared buffers while the context is still alive
     for (auto & kv : sess->graphs) {
@@ -316,24 +370,18 @@ void ggml_qnn_session_free(ggml_qnn_session * sess) {
 // graph building
 //
 
-static Qnn_DataType_t ggml_qnn_dtype(enum ggml_type type) {
-    return type == GGML_TYPE_F16 ? QNN_DATATYPE_FLOAT_16 : QNN_DATATYPE_FLOAT_32;
-}
-
 // the on-device weight dtype: F32 stays F32, F16 and every quantized type land as F16
 static Qnn_DataType_t ggml_qnn_weight_dtype(enum ggml_type type) {
     return type == GGML_TYPE_F32 ? QNN_DATATYPE_FLOAT_32 : QNN_DATATYPE_FLOAT_16;
 }
 
-// weights in a model buffer can be baked into the graph as a static tensor, QNN then converts
-// them to the HTP layout once at finalize instead of on every execute
-// experimental: costs an internal weight copy and the graph cache is keyed by the data address,
-// so a freed model can leave a stale graph behind
-// a model weight (fp32, fp16, or quantized) can be baked once into the graph in HTP-native layout.
-// quantized weights are dequantized to fp16 at bake time, so this is correct and memory-light
+// weights in a model buffer are baked into the graph as a static tensor: QNN converts them
+// to the HTP-native layout once at finalize instead of on every execute (up to 64x faster),
+// and a quantized source is dequantized to fp16 once at bake. on by default, subject to the
+// static budget; GGML_QNN_NO_STATIC_WEIGHTS disables
 static bool ggml_qnn_weights_static(const ggml_tensor * node) {
-    static const bool enabled = getenv("GGML_QNN_STATIC_WEIGHTS") != nullptr;
-    return enabled && node->op == GGML_OP_MUL_MAT && node->src[0]->data &&
+    static const bool disabled = getenv("GGML_QNN_NO_STATIC_WEIGHTS") != nullptr;
+    return !disabled && node->op == GGML_OP_MUL_MAT && node->src[0]->data &&
            node->src[0]->buffer && node->src[0]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
            (!ggml_is_quantized(node->src[0]->type) || ggml_get_type_traits(node->src[0]->type)->to_float != NULL);
 }
@@ -342,6 +390,29 @@ static bool ggml_qnn_weights_static(const ggml_tensor * node) {
 static size_t ggml_qnn_static_bytes(const ggml_tensor * w) {
     const size_t elem = w->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
     return (size_t) ggml_nelements(w) * elem;
+}
+
+// static-weight matmul graphs are built with the batch dim padded up to a bucket, so llama
+// probing N=512 and then decoding N=60 reuses one graph and bakes each weight once
+static uint32_t ggml_qnn_pad_n(uint32_t n) {
+    static const uint32_t floor_n = getenv("GGML_QNN_NPAD") ? (uint32_t) atoi(getenv("GGML_QNN_NPAD")) : 512;
+    uint32_t p = floor_n ? floor_n : 1;
+    while (p < n) {
+        p <<= 1;
+    }
+    return p;
+}
+
+// dequantize a contiguous 2D weight to fp16 row by row, so no full fp32 copy is ever held
+static void ggml_qnn_dequant_f16(const ggml_tensor * w, ggml_fp16_t * dst) {
+    const auto * traits = ggml_get_type_traits(w->type);
+    const int64_t K = w->ne[0];
+    const int64_t M = w->ne[1];
+    std::vector<float> row((size_t) K);
+    for (int64_t r = 0; r < M; r++) {
+        traits->to_float((const char *) w->data + r * w->nb[1], row.data(), K);
+        ggml_fp32_to_fp16_row(row.data(), dst + (size_t) r * K, K);
+    }
 }
 
 static bool ggml_qnn_tensor_init(ggml_qnn_session * sess, ggml_qnn_graph & g, Qnn_Tensor_t & t,
@@ -412,55 +483,60 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
 
     g.weights_static   = ggml_qnn_weights_static(node);
     g.weight_quantized = ggml_is_quantized(src0->type);
+    g.n_pad            = g.weights_static ? ggml_qnn_pad_n(N) : N;
 
-    // static weights fit within the NPU memory budget, past it a weight stays on the CPU
+    const uint32_t Nb = g.n_pad;
+    if ((uint64_t) K * Nb * sizeof(float) > UINT32_MAX || (uint64_t) M * Nb * sizeof(float) > UINT32_MAX) {
+        return false;
+    }
+
+    // static weights fit within the NPU memory budget, past it a weight stays on the CPU.
+    // the budget is charged only after finalize succeeds
     if (g.weights_static && sess->static_budget) {
         const size_t need = ggml_qnn_static_bytes(src0);
         if (sess->static_bytes + need > sess->static_budget) {
+            g.policy_reject = true;
             return false;
         }
+        g.pending_static_bytes = need;
     }
     // a quantized weight that is not baked statically has no correct NPU path (the per-execute
     // dequant path is experimental and gated), so keep it on the CPU
     if (g.weight_quantized && !g.weights_static && !getenv("GGML_QNN_QUANTIZED")) {
+        g.policy_reject = true;
         return false;
-    }
-
-    if (g.weight_quantized) {
-        g.dequant_f32.resize((size_t) M * K);
-        g.dequant_f16.resize((size_t) M * K);
     }
 
     // ggml: dst(NxM row-major) = src1(NxK) * src0(MxK)^T
     g.inputs.resize(g.weights_static ? 1 : 2);
-    if (!ggml_qnn_tensor_init(sess, g, g.inputs[0], "in0", QNN_TENSOR_TYPE_APP_WRITE, {N, K}, QNN_DATATYPE_FLOAT_32)) {
+    if (!ggml_qnn_tensor_init(sess, g, g.inputs[0], "in0", QNN_TENSOR_TYPE_APP_WRITE, {Nb, K}, QNN_DATATYPE_FLOAT_32)) {
         return false;
     }
 
     Qnn_Tensor_t & w = g.weights_static ? g.weights : g.inputs[1];
     if (g.weights_static) {
-        // bake the weight once, dequantizing a quantized source to fp16 first
-        const void * wdata = src0->data;
-        uint32_t     wsize = (uint32_t) ggml_nbytes(src0);
+        // bake the weight once, dequantizing a quantized source to fp16 first. the fp16
+        // staging is freed after finalize, QNN owns the converted copy from then on
+        void *   wdata = src0->data;
+        uint32_t wsize = (uint32_t) ggml_nbytes(src0);
         if (g.weight_quantized) {
             const int64_t n = ggml_nelements(src0);
-            ggml_get_type_traits(src0->type)->to_float(src0->data, g.dequant_f32.data(), n);
-            ggml_fp32_to_fp16_row(g.dequant_f32.data(), g.dequant_f16.data(), n);
-            wdata = g.dequant_f16.data();
+            g.bake_f16.resize((size_t) n);
+            ggml_qnn_dequant_f16(src0, g.bake_f16.data());
+            wdata = g.bake_f16.data();
             wsize = (uint32_t) (n * sizeof(ggml_fp16_t));
         }
         if (!ggml_qnn_tensor_init(sess, g, w, "in1", QNN_TENSOR_TYPE_STATIC, {M, K}, ggml_qnn_weight_dtype(src0->type),
-                                  (void *) wdata, wsize)) {
+                                  wdata, wsize)) {
             return false;
         }
-        sess->static_bytes += ggml_qnn_static_bytes(src0);
     } else {
         if (!ggml_qnn_tensor_init(sess, g, w, "in1", QNN_TENSOR_TYPE_APP_WRITE, {M, K}, ggml_qnn_weight_dtype(src0->type))) {
             return false;
         }
     }
 
-    if (!ggml_qnn_tensor_init(sess, g, g.output, "out", QNN_TENSOR_TYPE_APP_READ, {N, M}, QNN_DATATYPE_FLOAT_32)) {
+    if (!ggml_qnn_tensor_init(sess, g, g.output, "out", QNN_TENSOR_TYPE_APP_READ, {Nb, M}, QNN_DATATYPE_FLOAT_32)) {
         return false;
     }
 
@@ -482,6 +558,7 @@ static bool ggml_qnn_build_binary(ggml_qnn_session * sess, ggml_qnn_graph & g, c
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
 
+    g.n_pad = 0;
     g.inputs.resize(2);
     if (!ggml_qnn_tensor_init(sess, g, g.inputs[0], "in0", QNN_TENSOR_TYPE_APP_WRITE, ggml_qnn_dims(src0), QNN_DATATYPE_FLOAT_32) ||
         !ggml_qnn_tensor_init(sess, g, g.inputs[1], "in1", QNN_TENSOR_TYPE_APP_WRITE, ggml_qnn_dims(src1), QNN_DATATYPE_FLOAT_32) ||
@@ -493,19 +570,92 @@ static bool ggml_qnn_build_binary(ggml_qnn_session * sess, ggml_qnn_graph & g, c
     return ggml_qnn_add_node(sess, g, type_name, nullptr, 0, g.inputs.data(), (uint32_t) g.inputs.size());
 }
 
-static std::string ggml_qnn_graph_key(const ggml_tensor * node) {
+// shape-only key: stable across runs, used for the failed-shape denylist
+static std::string ggml_qnn_shape_key(const ggml_tensor * node) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
 
+    // static matmul graphs use the padded batch dim, so every N in a bucket shares one graph
+    const int64_t ne11 = ggml_qnn_weights_static(node) ? (int64_t) ggml_qnn_pad_n((uint32_t) src1->ne[1]) : src1->ne[1];
+
     char buf[256];
-    int n = snprintf(buf, sizeof(buf), "%s_%s_%s_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+    snprintf(buf, sizeof(buf), "%s_%s_%s_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
              ggml_op_name(node->op), ggml_type_name(src0->type), ggml_type_name(src1->type),
              src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-             src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
-    if (ggml_qnn_weights_static(node)) {
-        snprintf(buf + n, sizeof(buf) - n, "_w%p", src0->data);
-    }
+             src1->ne[0], ne11, src1->ne[2], src1->ne[3]);
     return buf;
+}
+
+static std::string ggml_qnn_graph_key(const ggml_tensor * node) {
+    std::string key = ggml_qnn_shape_key(node);
+    if (ggml_qnn_weights_static(node)) {
+        // one baked-weight graph per weight tensor
+        char suffix[32];
+        snprintf(suffix, sizeof(suffix), "_w%p", node->src[0]->data);
+        key += suffix;
+    }
+    return key;
+}
+
+//
+// failed-shape denylist
+//
+
+// shapes that failed or wedged the HTP, kept process-global so the knowledge survives the
+// session teardown between llama's probe and context phases. GGML_QNN_DENYLIST names a file
+// that persists it across runs, so a rerun after a wedge skips the bad shape entirely
+static std::mutex                       ggml_qnn_denylist_mutex;
+static std::unordered_map<std::string, bool> ggml_qnn_denylist; // value unused
+
+static const char * ggml_qnn_denylist_path(void) {
+    static const char * path = getenv("GGML_QNN_DENYLIST");
+    return path;
+}
+
+static void ggml_qnn_denylist_load_once(void) {
+    static bool loaded = false;
+    if (loaded) {
+        return;
+    }
+    loaded = true;
+    const char * path = ggml_qnn_denylist_path();
+    if (!path) {
+        return;
+    }
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0]) {
+            ggml_qnn_denylist.emplace(line, true);
+        }
+    }
+    fclose(f);
+    GGML_LOG_INFO("ggml-qnn: loaded %zu denylisted shapes from %s\n", ggml_qnn_denylist.size(), path);
+}
+
+static bool ggml_qnn_denylisted(const std::string & shape_key) {
+    std::lock_guard<std::mutex> lock(ggml_qnn_denylist_mutex);
+    ggml_qnn_denylist_load_once();
+    return ggml_qnn_denylist.count(shape_key) != 0;
+}
+
+static void ggml_qnn_denylist_add(const std::string & shape_key) {
+    std::lock_guard<std::mutex> lock(ggml_qnn_denylist_mutex);
+    if (!ggml_qnn_denylist.emplace(shape_key, true).second) {
+        return;
+    }
+    const char * path = ggml_qnn_denylist_path();
+    if (path) {
+        FILE * f = fopen(path, "a");
+        if (f) {
+            fprintf(f, "%s\n", shape_key.c_str());
+            fclose(f);
+        }
+    }
 }
 
 // serialize the finalized context to a binary, reload it into a fresh context, and time both,
@@ -544,7 +694,97 @@ static void ggml_qnn_aot_roundtrip(ggml_qnn_session * sess, const std::string & 
                   graph_key.c_str(), finalize_ms, serialize_ms, (size_t) written, load_ms, retrieved ? "ok" : "FAIL");
 }
 
-static void ggml_qnn_graph_setup_shared_mem(ggml_qnn_session * sess, ggml_qnn_graph & g, const ggml_tensor * node);
+//
+// graph IO buffers
+//
+
+// byte size of graph input slot i, matching the on-device tensor dims and dtype
+static size_t ggml_qnn_input_size(const ggml_qnn_graph & g, const ggml_tensor * node, size_t i) {
+    if (node->op == GGML_OP_MUL_MAT) {
+        if (i == 0) {
+            return (size_t) node->src[1]->ne[0] * g.n_pad * sizeof(float);
+        }
+        return g.weight_quantized ? (size_t) ggml_nelements(node->src[0]) * sizeof(ggml_fp16_t)
+                                  : ggml_nbytes(node->src[0]);
+    }
+    return ggml_nbytes(node->src[i]);
+}
+
+static size_t ggml_qnn_output_size(const ggml_qnn_graph & g, const ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT) {
+        return (size_t) node->src[0]->ne[1] * g.n_pad * sizeof(float);
+    }
+    return ggml_nbytes(node);
+}
+
+static void * ggml_qnn_input_ptr(ggml_qnn_graph * g, size_t i) {
+    return g->shared_mem ? g->mem_inputs[i].data : (void *) g->host_inputs[i].data();
+}
+
+static void * ggml_qnn_output_ptr(ggml_qnn_graph * g) {
+    return g->shared_mem ? g->mem_output.data : (void *) g->host_output.data();
+}
+
+// allocate the graph-owned IO buffers and bind them into the tensors once. registered
+// fastrpc memory when GGML_QNN_SHARED_MEM is set and works, plain host memory otherwise
+static bool ggml_qnn_graph_setup_io(ggml_qnn_session * sess, ggml_qnn_graph & g, const ggml_tensor * node) {
+    const size_t n_in = g.inputs.size();
+
+    if (getenv("GGML_QNN_SHARED_MEM") && ggml_qnn_mem_available()) {
+        bool ok = true;
+        g.mem_inputs.resize(n_in);
+        for (size_t i = 0; i < n_in && ok; i++) {
+            ok = ggml_qnn_mem_alloc(&sess->iface, sess->context_handle, ggml_qnn_input_size(g, node, i), &g.mem_inputs[i]);
+        }
+        if (ok) {
+            ok = ggml_qnn_mem_alloc(&sess->iface, sess->context_handle, ggml_qnn_output_size(g, node), &g.mem_output);
+        }
+        if (ok) {
+            for (size_t i = 0; i < n_in; i++) {
+                memset(g.mem_inputs[i].data, 0, g.mem_inputs[i].size);
+                g.inputs[i].v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+                g.inputs[i].v1.memHandle = g.mem_inputs[i].handle;
+            }
+            memset(g.mem_output.data, 0, g.mem_output.size);
+            g.output.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+            g.output.v1.memHandle = g.mem_output.handle;
+            g.shared_mem = true;
+            return true;
+        }
+        for (auto & b : g.mem_inputs) {
+            ggml_qnn_mem_free(&sess->iface, &b);
+        }
+        ggml_qnn_mem_free(&sess->iface, &g.mem_output);
+        g.mem_inputs.clear();
+        GGML_LOG_DEBUG("ggml-qnn: shared memory setup failed, using host buffers for this graph\n");
+    }
+
+    g.host_inputs.resize(n_in);
+    for (size_t i = 0; i < n_in; i++) {
+        g.host_inputs[i].assign(ggml_qnn_input_size(g, node, i), 0);
+        g.inputs[i].v1.clientBuf.data     = g.host_inputs[i].data();
+        g.inputs[i].v1.clientBuf.dataSize = (uint32_t) g.host_inputs[i].size();
+    }
+    g.host_output.assign(ggml_qnn_output_size(g, node), 0);
+    g.output.v1.clientBuf.data     = g.host_output.data();
+    g.output.v1.clientBuf.dataSize = (uint32_t) g.host_output.size();
+    return true;
+}
+
+static void ggml_qnn_graph_release_buffers(ggml_qnn_session * sess, ggml_qnn_graph & g) {
+    for (auto & b : g.mem_inputs) {
+        ggml_qnn_mem_free(&sess->iface, &b);
+    }
+    ggml_qnn_mem_free(&sess->iface, &g.mem_output);
+    g.mem_inputs.clear();
+    g.host_inputs.clear();
+    g.host_output.clear();
+    std::vector<ggml_fp16_t>().swap(g.bake_f16);
+}
+
+//
+// graph cache
+//
 
 static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_tensor * node) {
     const std::string key = ggml_qnn_graph_key(node);
@@ -552,6 +792,24 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
     auto it = sess->graphs.find(key);
     if (it != sess->graphs.end()) {
         return &it->second;
+    }
+
+    // a shape that failed before (this run or, with GGML_QNN_DENYLIST, an earlier one) is
+    // never built again: no doomed 1-13s finalize per start, no second wedge on a bad shape
+    const std::string shape_key = ggml_qnn_shape_key(node);
+    if (ggml_qnn_denylisted(shape_key)) {
+        ggml_qnn_graph negative;
+        auto res = sess->graphs.emplace(key, std::move(negative));
+        return &res.first->second;
+    }
+
+    // burst clocks are applied on first real use, so merely enumerating the device
+    // does not pin the NPU at TURBO
+    if (!sess->burst_tried) {
+        sess->burst_tried = true;
+        if (!getenv("GGML_QNN_NO_BURST")) {
+            ggml_qnn_set_burst_mode(sess);
+        }
     }
 
     ggml_qnn_graph g;
@@ -577,12 +835,12 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
     cfg_opt.option       = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
     cfg_opt.customConfig = &optimize;
 
-    // matmul runs in fp16 for speed, elementwise stays fp32 for precision, both optimized
     const QnnGraph_Config_t * cfgs_mm[]  = { &cfg_prec, &cfg_opt, nullptr };
     const QnnGraph_Config_t * cfgs_ew[]  = { &cfg_opt, nullptr };
     const QnnGraph_Config_t ** graph_cfgs = node->op == GGML_OP_MUL_MAT ? cfgs_mm : cfgs_ew;
 
-    bool ok = sess->iface.graphCreate(sess->context_handle, key.c_str(), graph_cfgs, &g.handle) == QNN_SUCCESS;
+    bool ok        = sess->iface.graphCreate(sess->context_handle, key.c_str(), graph_cfgs, &g.handle) == QNN_SUCCESS;
+    bool timed_out = false;
     if (!ok) {
         GGML_LOG_ERROR("ggml-qnn: failed to create graph %s\n", key.c_str());
         g.handle = nullptr;
@@ -602,23 +860,22 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
         }
     }
 
-    // experimental: measure whether an AOT context binary reloads faster than a fresh finalize,
-    // this is the decisive question for a compile-once/load-fast NPU path (route 2)
+    // experimental: measure whether an AOT context binary reloads faster than a fresh finalize
     static bool aot_tested = false;
     const bool aot_test = ok && !aot_tested && getenv("GGML_QNN_AOT_TEST");
 
     auto t_fin = std::chrono::steady_clock::now();
     if (ok) {
-        // finalize under a watchdog: a shape that wedges the HTP hangs here, and since this runs
-        // inside supports_op's trial-build, a timeout makes supports_op return false so the op is
-        // placed on the CPU before compute (the model runs instead of hanging)
-        Qnn_GraphHandle_t          h   = g.handle;
-        QNN_INTERFACE_VER_TYPE *   ifp = &sess->iface;
-        Qnn_ErrorHandle_t          fin = QNN_SUCCESS;
-        const bool completed = ggml_qnn_call_timed([ifp, h]() { return ifp->graphFinalize(h, nullptr, nullptr); }, &fin);
+        // a shape that wedges the HTP hangs in finalize; the timeout makes supports_op
+        // return false so the op is placed on the CPU before compute
+        Qnn_GraphHandle_t        h   = g.handle;
+        QNN_INTERFACE_VER_TYPE * ifp = &sess->iface;
+        Qnn_ErrorHandle_t        fin = QNN_SUCCESS;
+        const bool completed = ggml_qnn_call_timed(sess, [ifp, h]() { return ifp->graphFinalize(h, nullptr, nullptr); }, &fin);
         if (!completed) {
             GGML_LOG_ERROR("ggml-qnn: graph finalize timed out for %s, HTP wedged - degrading to CPU\n", key.c_str());
             sess->degraded = true;
+            timed_out = true;
             ok = false;
         } else if (fin != QNN_SUCCESS) {
             GGML_LOG_ERROR("ggml-qnn: failed to finalize graph %s\n", key.c_str());
@@ -627,18 +884,57 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
     }
     const double finalize_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_fin).count();
 
+    if (ok && g.weights_static) {
+        sess->static_bytes += g.pending_static_bytes;
+        // QNN owns the HTP-layout copy from finalize on, drop the host staging
+        std::vector<ggml_fp16_t>().swap(g.bake_f16);
+    }
+
     if (aot_test && ok) {
         aot_tested = true;
         ggml_qnn_aot_roundtrip(sess, key, finalize_ms);
     }
 
     if (ok) {
-        ggml_qnn_graph_setup_shared_mem(sess, g, node);
-        GGML_LOG_DEBUG("ggml-qnn: built graph %s%s\n", key.c_str(), g.shared_mem ? " (shared mem)" : "");
+        ok = ggml_qnn_graph_setup_io(sess, g, node);
     }
 
-    if (!ok) {
-        // negative cache: remember the failure, QNN graphs live until the context is freed
+    // test-execute once on the zeroed IO buffers: a shape that finalizes but wedges or fails
+    // at execute is rejected here, at supports_op time, instead of aborting a llama_decode
+    // batch later. an execute failure can poison the shared context, so it degrades the session
+    if (ok && !getenv("GGML_QNN_NO_PREVALIDATE")) {
+        Qnn_GraphHandle_t        h     = g.handle;
+        Qnn_Tensor_t *           ins   = g.inputs.data();
+        uint32_t                 n_ins = (uint32_t) g.inputs.size();
+        Qnn_Tensor_t *           out   = &g.output;
+        QNN_INTERFACE_VER_TYPE * ifp   = &sess->iface;
+        Qnn_ErrorHandle_t        err   = QNN_SUCCESS;
+        const bool completed = ggml_qnn_call_timed(sess,
+            [ifp, h, ins, n_ins, out]() { return ifp->graphExecute(h, ins, n_ins, out, 1, nullptr, nullptr); }, &err);
+        if (!completed) {
+            GGML_LOG_ERROR("ggml-qnn: validation execute timed out for %s, HTP wedged - degrading to CPU\n", key.c_str());
+            sess->degraded = true;
+            timed_out = true;
+            ok = false;
+        } else if (err != QNN_SUCCESS) {
+            GGML_LOG_ERROR("ggml-qnn: validation execute failed for %s: %" PRIu64 " - degrading to CPU\n", key.c_str(), (uint64_t) err);
+            sess->degraded = true;
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        GGML_LOG_DEBUG("ggml-qnn: built graph %s%s%s\n", key.c_str(),
+                       g.shared_mem ? " (shared mem)" : "", g.weights_static ? " (static weights)" : "");
+    } else {
+        // negative cache: remember the failure, QNN graphs live until the context is freed.
+        // after a timeout the abandoned driver call may still touch the buffers, so leak them
+        if (!g.policy_reject) {
+            ggml_qnn_denylist_add(shape_key);
+        }
+        if (!timed_out) {
+            ggml_qnn_graph_release_buffers(sess, g);
+        }
         g.handle = nullptr;
     }
 
@@ -649,63 +945,6 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
 //
 // execution
 //
-
-static void ggml_qnn_bind_tensor(Qnn_Tensor_t & t, const ggml_tensor * src) {
-    t.v1.clientBuf.data     = src->data;
-    t.v1.clientBuf.dataSize = (uint32_t) ggml_nbytes(src);
-}
-
-// bind host data into input slot i: copy into the registered shared buffer and point the tensor
-// at its memHandle (no per-execute re-map), or fall back to a RAW client buffer
-static void ggml_qnn_bind_input(ggml_qnn_graph * g, size_t i, const void * data, uint32_t size) {
-    if (g->shared_mem) {
-        memcpy(g->mem_inputs[i].data, data, size);
-        g->inputs[i].v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
-        g->inputs[i].v1.memHandle = g->mem_inputs[i].handle;
-    } else {
-        g->inputs[i].v1.clientBuf.data     = (void *) data;
-        g->inputs[i].v1.clientBuf.dataSize = size;
-    }
-}
-
-// byte size the registered buffer for input slot i must hold (matches the on-device tensor dtype)
-static uint32_t ggml_qnn_input_size(const ggml_tensor * node, bool weight_quantized, size_t i) {
-    if (node->op == GGML_OP_MUL_MAT) {
-        if (i == 0) {
-            return (uint32_t) ggml_nbytes(node->src[1]);
-        }
-        return weight_quantized ? (uint32_t) (ggml_nelements(node->src[0]) * sizeof(ggml_fp16_t))
-                                : (uint32_t) ggml_nbytes(node->src[0]);
-    }
-    return (uint32_t) ggml_nbytes(node->src[i]);
-}
-
-// allocate + register a shared buffer for each graph input and the output, called after finalize
-static void ggml_qnn_graph_setup_shared_mem(ggml_qnn_session * sess, ggml_qnn_graph & g, const ggml_tensor * node) {
-    if (!getenv("GGML_QNN_SHARED_MEM") || !ggml_qnn_mem_available()) {
-        return;
-    }
-
-    bool ok = true;
-    g.mem_inputs.resize(g.inputs.size());
-    for (size_t i = 0; i < g.inputs.size() && ok; i++) {
-        ok = ggml_qnn_mem_alloc(&sess->iface, sess->context_handle,
-                                ggml_qnn_input_size(node, g.weight_quantized, i), &g.mem_inputs[i]);
-    }
-    if (ok) {
-        ok = ggml_qnn_mem_alloc(&sess->iface, sess->context_handle, (size_t) ggml_nbytes(node), &g.mem_output);
-    }
-    if (!ok) {
-        for (auto & b : g.mem_inputs) {
-            ggml_qnn_mem_free(&sess->iface, &b);
-        }
-        ggml_qnn_mem_free(&sess->iface, &g.mem_output);
-        g.mem_inputs.clear();
-        GGML_LOG_DEBUG("ggml-qnn: shared memory setup failed, using RAW buffers for this graph\n");
-        return;
-    }
-    g.shared_mem = true;
-}
 
 bool ggml_qnn_supports_node(ggml_qnn_session * sess, const struct ggml_tensor * node) {
     std::lock_guard<std::mutex> lock(sess->mutex);
@@ -738,51 +977,43 @@ enum ggml_status ggml_qnn_compute_node(ggml_qnn_session * sess, struct ggml_tens
 
     switch (node->op) {
         case GGML_OP_MUL_MAT: {
-            // MatMul in0 is the activations (src1), in1 is the weights (src0)
-            ggml_qnn_bind_input(g, 0, node->src[1]->data, (uint32_t) ggml_nbytes(node->src[1]));
+            // MatMul in0 is the activations (src1), in1 is the weights (src0). only the real
+            // N rows are copied, the padded tail rows produce output rows nobody reads
+            memcpy(ggml_qnn_input_ptr(g, 0), node->src[1]->data, ggml_nbytes(node->src[1]));
             if (g->weights_static) {
                 break;
             }
             const ggml_tensor * w = node->src[0];
-            // a constant weight already sits in its shared buffer, skip the dequant and the copy
-            if (g->shared_mem && g->weight_cached_ptr == w->data) {
+            // a model weight is immutable, so it is copied into its IO buffer once
+            const bool is_const = w->buffer && w->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+            if (is_const && g->weight_cached_ptr == w->data) {
                 break;
             }
             if (g->weight_quantized) {
-                // dequantize the weights to fp16 on the host, HTP has no quantized matmul path here
-                const int64_t n = ggml_nelements(w);
-                ggml_get_type_traits(w->type)->to_float(w->data, g->dequant_f32.data(), n);
-                ggml_fp32_to_fp16_row(g->dequant_f32.data(), g->dequant_f16.data(), n);
-                ggml_qnn_bind_input(g, 1, g->dequant_f16.data(), (uint32_t) (n * sizeof(ggml_fp16_t)));
+                ggml_qnn_dequant_f16(w, (ggml_fp16_t *) ggml_qnn_input_ptr(g, 1));
             } else {
-                ggml_qnn_bind_input(g, 1, w->data, (uint32_t) ggml_nbytes(w));
+                memcpy(ggml_qnn_input_ptr(g, 1), w->data, ggml_nbytes(w));
             }
-            g->weight_cached_ptr = w->data;
+            g->weight_cached_ptr = is_const ? w->data : nullptr;
             break;
         }
         default:
-            ggml_qnn_bind_input(g, 0, node->src[0]->data, (uint32_t) ggml_nbytes(node->src[0]));
-            ggml_qnn_bind_input(g, 1, node->src[1]->data, (uint32_t) ggml_nbytes(node->src[1]));
+            memcpy(ggml_qnn_input_ptr(g, 0), node->src[0]->data, ggml_nbytes(node->src[0]));
+            memcpy(ggml_qnn_input_ptr(g, 1), node->src[1]->data, ggml_nbytes(node->src[1]));
             break;
     }
 
-    if (g->shared_mem) {
-        g->output.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
-        g->output.v1.memHandle = g->mem_output.handle;
-    } else {
-        ggml_qnn_bind_tensor(g->output, node);
-    }
-
-    Qnn_GraphHandle_t          h     = g->handle;
-    Qnn_Tensor_t *             ins   = g->inputs.data();
-    uint32_t                   n_ins = (uint32_t) g->inputs.size();
-    Qnn_Tensor_t *             out   = &g->output;
-    QNN_INTERFACE_VER_TYPE *   ifp   = &sess->iface;
-    Qnn_ErrorHandle_t          err   = QNN_SUCCESS;
-    const bool completed = ggml_qnn_call_timed(
+    Qnn_GraphHandle_t        h     = g->handle;
+    Qnn_Tensor_t *           ins   = g->inputs.data();
+    uint32_t                 n_ins = (uint32_t) g->inputs.size();
+    Qnn_Tensor_t *           out   = &g->output;
+    QNN_INTERFACE_VER_TYPE * ifp   = &sess->iface;
+    Qnn_ErrorHandle_t        err   = QNN_SUCCESS;
+    const bool completed = ggml_qnn_call_timed(sess,
         [ifp, h, ins, n_ins, out]() { return ifp->graphExecute(h, ins, n_ins, out, 1, nullptr, nullptr); }, &err);
     if (!completed) {
         GGML_LOG_ERROR("ggml-qnn: graph execute timed out for %s, HTP wedged - degrading to CPU\n", ggml_op_desc(node));
+        ggml_qnn_denylist_add(ggml_qnn_shape_key(node));
         g->handle      = nullptr;
         sess->degraded = true;
         return GGML_STATUS_FAILED;
@@ -791,14 +1022,13 @@ enum ggml_status ggml_qnn_compute_node(ggml_qnn_session * sess, struct ggml_tens
         GGML_LOG_ERROR("ggml-qnn: graph execute failed for %s: %" PRIu64 "\n", ggml_op_desc(node), (uint64_t) err);
         // a failed execute (deferred prepare, device memory) can corrupt the shared HTP context,
         // so demote this graph and degrade the whole session to the CPU for what follows
+        ggml_qnn_denylist_add(ggml_qnn_shape_key(node));
         g->handle    = nullptr;
         sess->degraded = true;
         return GGML_STATUS_FAILED;
     }
 
-    if (g->shared_mem) {
-        memcpy(node->data, g->mem_output.data, ggml_nbytes(node));
-    }
+    memcpy(node->data, ggml_qnn_output_ptr(g), ggml_nbytes(node));
 
     return GGML_STATUS_SUCCESS;
 }

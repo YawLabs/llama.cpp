@@ -10,8 +10,10 @@
 #include <mutex>
 
 // backend instances share one refcounted session, freed when the last instance is freed:
-// tearing down at process exit instead (static destructors, atexit, DLL detach - all tried)
-// crashes inside QnnHtp
+// a session still alive at process exit crashes inside QnnHtp (ExitProcess kills its worker
+// threads before DLL detach; static destructors, atexit, DLL detach - all tried), so only
+// mid-process free is safe. a degraded session is deliberately leaked instead, an abandoned
+// watchdog call may still be touching it from inside the driver
 static std::mutex          ggml_qnn_session_mutex;
 static ggml_qnn_session *  ggml_qnn_session_ptr    = nullptr;
 static int                 ggml_qnn_session_refs   = 0;
@@ -33,6 +35,11 @@ static void ggml_backend_qnn_session_release(void) {
     std::lock_guard<std::mutex> lock(ggml_qnn_session_mutex);
     GGML_ASSERT(ggml_qnn_session_refs > 0);
     if (--ggml_qnn_session_refs == 0) {
+        if (ggml_qnn_session_ptr->degraded) {
+            GGML_LOG_WARN("ggml-qnn: leaking degraded session, the HTP may hold a stuck call\n");
+            ggml_qnn_session_ptr = nullptr; // next acquire starts fresh
+            return;
+        }
         ggml_qnn_session_free(ggml_qnn_session_ptr);
         ggml_qnn_session_ptr = nullptr;
     }
@@ -205,7 +212,7 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
             // a quantized weight is claimable only when it can be baked statically (dequant once,
             // correct) or the experimental per-execute dequant path is enabled
             static const bool quant_ok  = getenv("GGML_QNN_QUANTIZED") != nullptr;
-            static const bool static_on = getenv("GGML_QNN_STATIC_WEIGHTS") != nullptr;
+            static const bool static_on = getenv("GGML_QNN_NO_STATIC_WEIGHTS") == nullptr;
             const bool src0_ok = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
                                  ((quant_ok || static_on) && ggml_is_quantized(src0->type) &&
                                   ggml_get_type_traits(src0->type)->to_float != NULL);
@@ -258,7 +265,8 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
             }
 
             // elementwise ops are memory bound, offload only large tensors
-            static const int64_t min_elements = getenv("GGML_QNN_MIN_DIM") ? 1 : 1 << 20;
+            static const int64_t min_elements =
+                getenv("GGML_QNN_MIN_ELEMENTS") ? atoll(getenv("GGML_QNN_MIN_ELEMENTS")) : 1 << 20;
             if (ggml_nelements(src0) < min_elements || ggml_nbytes(src0) > UINT32_MAX) {
                 return false;
             }
@@ -269,10 +277,17 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
             return false;
     }
 
-    // the HTP can reject shapes at graph-finalize time (e.g. TCM tiling limits), so claim an op
-    // only after its graph actually builds, the result is cached with the graph
-    ggml_qnn_session * sess = ggml_backend_qnn_session_acquire(/*add_ref=*/false);
-    return sess && ggml_qnn_supports_node(sess, op);
+    // the HTP can reject shapes at graph-finalize time (e.g. TCM tiling limits) and can wedge
+    // at execute time, so claim an op only after its graph builds AND test-executes, the
+    // result is cached with the graph. hold a ref so a concurrent backend free cannot tear
+    // the session down mid-query
+    ggml_qnn_session * sess = ggml_backend_qnn_session_acquire(/*add_ref=*/true);
+    if (!sess) {
+        return false;
+    }
+    const bool ok = ggml_qnn_supports_node(sess, op);
+    ggml_backend_qnn_session_release();
+    return ok;
 
     GGML_UNUSED(dev);
 }

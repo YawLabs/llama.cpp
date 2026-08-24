@@ -10,32 +10,45 @@
 
 #include <QnnInterface.h>
 
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+struct ggml_qnn_call_worker;
+
 // a finalized single-op QNN graph, cached by op signature
 // handle == nullptr marks a signature that failed to build (negative cache)
 struct ggml_qnn_graph {
     Qnn_GraphHandle_t handle = nullptr;
-    // tensors bound to ggml data on every execute
+    // graph IO tensors, bound once to the graph-owned IO buffers below
     std::vector<Qnn_Tensor_t> inputs;
     Qnn_Tensor_t output = {};
     // weights baked into the graph at finalize, see ggml_qnn_weights_static
     Qnn_Tensor_t weights = {};
     bool weights_static = false;
-    // quantized weights are dequantized to fp16 on the host into these scratch buffers,
-    // then bound to the fp16 weight input on every execute
+    // static-weight matmul graphs are built with the batch dim padded up to a
+    // bucket so one graph (and one baked weight) serves every batch size, the
+    // unused rows are never copied back. 0 means the exact ggml shape
+    uint32_t n_pad = 0;
+    // on-device bytes to charge against the static budget once finalize succeeds
+    size_t pending_static_bytes = 0;
+    // build declined by policy (budget full, gated path), not a shape the HTP rejected
+    bool policy_reject = false;
+    // host fp16 staging for a quantized static bake, freed after finalize
+    std::vector<ggml_fp16_t> bake_f16;
     bool weight_quantized = false;
-    std::vector<float>       dequant_f32;
-    std::vector<ggml_fp16_t> dequant_f16;
-    // registered fastrpc shared memory for zero-remap graph IO (GGML_QNN_SHARED_MEM):
-    // one buffer per input and one for the output, bound as MEMHANDLE instead of RAW clientBuf
+    // graph-owned IO buffers: every execute copies in/out of these instead of
+    // binding ggml buffers directly, so an abandoned (timed out) execute can
+    // never touch memory the caller has freed. registered fastrpc buffers when
+    // GGML_QNN_SHARED_MEM is set and available, plain host memory otherwise
     bool shared_mem = false;
     std::vector<ggml_qnn_mem_buffer> mem_inputs;
     ggml_qnn_mem_buffer              mem_output;
-    // a constant weight is copied into its shared buffer once, this is the src it holds
+    std::vector<std::vector<uint8_t>> host_inputs;
+    std::vector<uint8_t>              host_output;
+    // a constant weight is copied into its IO buffer once, this is the src it holds
     const void * weight_cached_ptr = nullptr;
     // backing storage for the dimension arrays referenced by the tensors
     std::vector<std::vector<uint32_t>> dims;
@@ -51,9 +64,14 @@ struct ggml_qnn_session {
     Qnn_DeviceHandle_t  device_handle  = nullptr;
     Qnn_ContextHandle_t context_handle = nullptr;
 
-    // HTP burst-clock power config, held for the session lifetime
+    // HTP burst-clock power config, applied lazily on first graph use
     uint32_t power_config_id  = 0;
     bool     has_power_config = false;
+    bool     burst_tried      = false;
+
+    // runs QNN calls that can hang (finalize/execute) with a timeout,
+    // abandoned if a call never returns. created on first use, leaked on abandon
+    ggml_qnn_call_worker * worker = nullptr;
 
     // guards the graph cache and the bind+execute sequence, backend instances share one session
     std::mutex mutex;
@@ -63,7 +81,7 @@ struct ggml_qnn_session {
     bool degraded = false;
 
     // static-weight memory budget (bytes): only pin weights on the NPU up to this, the rest stay
-    // on the CPU. 0 means unlimited. GGML_QNN_STATIC_BUDGET_MB sets it.
+    // on the CPU. 0 means unlimited. GGML_QNN_STATIC_BUDGET_MB sets it, default 2048
     size_t static_budget = 0;
     size_t static_bytes  = 0;
 
@@ -79,6 +97,7 @@ void ggml_qnn_session_free(ggml_qnn_session * sess);
 // execute one ggml node (MUL_MAT, ADD, MUL) on the NPU
 enum ggml_status ggml_qnn_compute_node(ggml_qnn_session * sess, struct ggml_tensor * node);
 
-// whether a QNN graph builds for this node, the HTP can reject shapes at finalize time
-// builds and caches the graph on first call
+// whether a QNN graph builds AND test-executes for this node, the HTP can reject shapes at
+// finalize time and can wedge at execute time. builds, validates and caches the graph on
+// first call, so real inference only ever runs graphs already proven to execute
 bool ggml_qnn_supports_node(ggml_qnn_session * sess, const struct ggml_tensor * node);
