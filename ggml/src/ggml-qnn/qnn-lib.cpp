@@ -480,7 +480,10 @@ static std::vector<uint32_t> ggml_qnn_dims(const ggml_tensor * t) {
     return dims;
 }
 
-static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, const ggml_tensor * node) {
+// policy checks that need no QNN graph. they must run BEFORE graphCreate: a rejected shape
+// must not leave an unfinalized graph in the shared context, because its deferred prepare
+// hangs the next graph's execute. fills the g fields build_mul_mat relies on
+static bool ggml_qnn_mul_mat_policy(ggml_qnn_session * sess, ggml_qnn_graph & g, const ggml_tensor * node) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
 
@@ -514,6 +517,16 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
         g.policy_reject = true;
         return false;
     }
+    return true;
+}
+
+static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, const ggml_tensor * node) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+
+    const uint32_t K = (uint32_t) src0->ne[0];
+    const uint32_t M = (uint32_t) src0->ne[1];
+    const uint32_t Nb = g.n_pad; // filled by ggml_qnn_mul_mat_policy before graphCreate
 
     // ggml: dst(NxM row-major) = src1(NxK) * src0(MxK)^T
     g.inputs.resize(g.weights_static ? 1 : 2);
@@ -812,6 +825,11 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
     // never built again: no doomed 1-13s finalize per start, no second wedge on a bad shape
     const std::string shape_key = ggml_qnn_shape_key(node);
     if (ggml_qnn_denylisted(shape_key)) {
+        return &g;
+    }
+
+    // policy rejections must not create a QNN graph at all
+    if (node->op == GGML_OP_MUL_MAT && !ggml_qnn_mul_mat_policy(sess, g, node)) {
         return &g;
     }
 
