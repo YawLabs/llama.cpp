@@ -2727,6 +2727,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "print list of available devices and exit",
         [](common_params &) {
             common_print_available_devices();
+            // flush before exit: a backend DLL can crash during process teardown and lose
+            // the buffered output
+            fflush(stdout);
             exit(0);
         }
     ));

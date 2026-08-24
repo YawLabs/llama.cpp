@@ -35,6 +35,9 @@ quantized weights to fp16 on the NPU within a memory budget.
 - Qualcomm AI Runtime (QAIRT) community SDK - headers only at build time.
 - `QnnHtp.dll` and its dependencies available at run time via `PATH` or `QNN_SDK_ROOT`
   (the SDK's `lib/aarch64-windows-msvc` directory works).
+- Newer QAIRT runtimes (2.45 tested) also need `ADSP_LIBRARY_PATH` set to the SDK's
+  `lib/hexagon-v73/unsigned` directory, or the first graph execute dies silently.
+  QAIRT 2.34 did not need this.
 
 ## Build
 
