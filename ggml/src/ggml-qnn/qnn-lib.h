@@ -47,8 +47,10 @@ struct ggml_qnn_graph {
     bool shared_mem = false;
     std::vector<ggml_qnn_mem_buffer> mem_inputs;
     ggml_qnn_mem_buffer              mem_output;
-    std::vector<std::vector<uint8_t>> host_inputs;
-    std::vector<uint8_t>              host_output;
+    // page-aligned (hygiene only - the size-threshold hang was traced to IO transfer size,
+    // not alignment)
+    std::vector<void *> host_inputs;
+    void *              host_output = nullptr;
     // a constant weight is copied into its IO buffer once, this is the src it holds
     const void * weight_cached_ptr = nullptr;
     // backing storage for the dimension arrays referenced by the tensors

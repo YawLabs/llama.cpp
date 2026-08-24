@@ -29,9 +29,33 @@
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    include <windows.h>
+#    include <malloc.h>
 #else
 #    include <dlfcn.h>
 #endif
+
+// page-aligned host buffers for graph IO. kept as allocation hygiene: alignment was ruled
+// out as the cause of the size-threshold execute hang (that follows padded IO transfer size
+// alone - keep max(input, output) under ~1 MB via the pad bucket, see GGML_QNN_NPAD)
+static void * ggml_qnn_host_alloc(size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, 4096);
+#else
+    void * p = nullptr;
+    return posix_memalign(&p, 4096, size) == 0 ? p : nullptr;
+#endif
+}
+
+static void ggml_qnn_host_free(void * p) {
+    if (!p) {
+        return;
+    }
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
 
 //
 // dynamic loading
@@ -343,6 +367,12 @@ void ggml_qnn_session_free(ggml_qnn_session * sess) {
             ggml_qnn_mem_free(&sess->iface, &b);
         }
         ggml_qnn_mem_free(&sess->iface, &g.mem_output);
+        for (void * p : g.host_inputs) {
+            ggml_qnn_host_free(p);
+        }
+        g.host_inputs.clear();
+        ggml_qnn_host_free(g.host_output);
+        g.host_output = nullptr;
     }
     if (sess->context_handle) {
         sess->iface.contextFree(sess->context_handle, nullptr);
@@ -741,11 +771,11 @@ static size_t ggml_qnn_output_size(const ggml_qnn_graph & g, const ggml_tensor *
 }
 
 static void * ggml_qnn_input_ptr(ggml_qnn_graph * g, size_t i) {
-    return g->shared_mem ? g->mem_inputs[i].data : (void *) g->host_inputs[i].data();
+    return g->shared_mem ? g->mem_inputs[i].data : g->host_inputs[i];
 }
 
 static void * ggml_qnn_output_ptr(ggml_qnn_graph * g) {
-    return g->shared_mem ? g->mem_output.data : (void *) g->host_output.data();
+    return g->shared_mem ? g->mem_output.data : g->host_output;
 }
 
 // allocate the graph-owned IO buffers and bind them into the tensors once. registered
@@ -782,15 +812,25 @@ static bool ggml_qnn_graph_setup_io(ggml_qnn_session * sess, ggml_qnn_graph & g,
         GGML_LOG_DEBUG("ggml-qnn: shared memory setup failed, using host buffers for this graph\n");
     }
 
-    g.host_inputs.resize(n_in);
+    g.host_inputs.assign(n_in, nullptr);
     for (size_t i = 0; i < n_in; i++) {
-        g.host_inputs[i].assign(ggml_qnn_input_size(g, node, i), 0);
-        g.inputs[i].v1.clientBuf.data     = g.host_inputs[i].data();
-        g.inputs[i].v1.clientBuf.dataSize = (uint32_t) g.host_inputs[i].size();
+        const size_t sz = ggml_qnn_input_size(g, node, i);
+        g.host_inputs[i] = ggml_qnn_host_alloc(sz);
+        if (!g.host_inputs[i]) {
+            return false;
+        }
+        memset(g.host_inputs[i], 0, sz);
+        g.inputs[i].v1.clientBuf.data     = g.host_inputs[i];
+        g.inputs[i].v1.clientBuf.dataSize = (uint32_t) sz;
     }
-    g.host_output.assign(ggml_qnn_output_size(g, node), 0);
-    g.output.v1.clientBuf.data     = g.host_output.data();
-    g.output.v1.clientBuf.dataSize = (uint32_t) g.host_output.size();
+    const size_t out_sz = ggml_qnn_output_size(g, node);
+    g.host_output = ggml_qnn_host_alloc(out_sz);
+    if (!g.host_output) {
+        return false;
+    }
+    memset(g.host_output, 0, out_sz);
+    g.output.v1.clientBuf.data     = g.host_output;
+    g.output.v1.clientBuf.dataSize = (uint32_t) out_sz;
     return true;
 }
 
@@ -800,8 +840,12 @@ static void ggml_qnn_graph_release_buffers(ggml_qnn_session * sess, ggml_qnn_gra
     }
     ggml_qnn_mem_free(&sess->iface, &g.mem_output);
     g.mem_inputs.clear();
+    for (void * p : g.host_inputs) {
+        ggml_qnn_host_free(p);
+    }
     g.host_inputs.clear();
-    g.host_output.clear();
+    ggml_qnn_host_free(g.host_output);
+    g.host_output = nullptr;
     std::vector<uint8_t>().swap(g.bake);
 }
 
@@ -863,9 +907,16 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
     cfg_opt.option       = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
     cfg_opt.customConfig = &optimize;
 
-    const QnnGraph_Config_t * cfgs_mm[]  = { &cfg_prec, &cfg_opt, nullptr };
-    const QnnGraph_Config_t * cfgs_ew[]  = { &cfg_opt, nullptr };
-    const QnnGraph_Config_t ** graph_cfgs = node->op == GGML_OP_MUL_MAT ? cfgs_mm : cfgs_ew;
+    // GGML_QNN_NO_OPT drops the finalize-optimization flag, a debugging lever for
+    // execute-time hangs whose graphs finalize fine. matmul-only: the elementwise path is
+    // env-gated off everywhere, so a no-opt variant for it would ship unexercised
+    static const bool no_opt = getenv("GGML_QNN_NO_OPT") != nullptr;
+    const QnnGraph_Config_t * cfgs_mm[]       = { &cfg_prec, &cfg_opt, nullptr };
+    const QnnGraph_Config_t * cfgs_mm_noopt[] = { &cfg_prec, nullptr };
+    const QnnGraph_Config_t * cfgs_ew[]       = { &cfg_opt, nullptr };
+    const QnnGraph_Config_t ** graph_cfgs = node->op == GGML_OP_MUL_MAT
+        ? (no_opt ? cfgs_mm_noopt : cfgs_mm)
+        : cfgs_ew;
 
     bool ok        = sess->iface.graphCreate(sess->context_handle, key.c_str(), graph_cfgs, &g.handle) == QNN_SUCCESS;
     bool timed_out = false;
@@ -926,6 +977,11 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
 
     if (ok) {
         ok = ggml_qnn_graph_setup_io(sess, g, node);
+        if (!ok) {
+            // host allocation failure is an environment verdict, not an HTP one: negative-cache
+            // for this session but never denylist the shape
+            g.policy_reject = true;
+        }
     }
 
     // test-execute once on the zeroed IO buffers: a shape that finalizes but wedges or fails
