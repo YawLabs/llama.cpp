@@ -150,6 +150,30 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 
+if (GGML_QNN)
+    # QNN backend lifecycle tests: need real HTP hardware, skip cleanly elsewhere.
+    # Serial: the HTP is single-client. The watchdog mode is judged by its output
+    # marker because the deliberately leaked degraded session can crash during exit.
+    llama_build(test-qnn-lifecycle.cpp)
+
+    llama_test(test-qnn-lifecycle NAME test-qnn-basic    ARGS basic)
+    llama_test(test-qnn-lifecycle NAME test-qnn-budget   ARGS budget)
+    llama_test(test-qnn-lifecycle NAME test-qnn-denylist ARGS denylist)
+    llama_test(test-qnn-lifecycle NAME test-qnn-watchdog ARGS watchdog)
+    set_tests_properties(test-qnn-basic test-qnn-budget test-qnn-denylist test-qnn-watchdog
+        PROPERTIES RUN_SERIAL TRUE)
+    set_tests_properties(test-qnn-watchdog PROPERTIES
+        PASS_REGULAR_EXPRESSION "WATCHDOG-CHECKS-PASSED|skipping")
+
+    # --list-devices must produce output: a backend-DLL teardown crash used to destroy
+    # the buffered stdout before the CRT flushed it, exiting 0 with zero bytes
+    llama_test_cmd(
+        bash
+        NAME test-list-devices-output
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-list-devices-output.sh $<TARGET_FILE:llama-cli>
+    )
+endif()
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
