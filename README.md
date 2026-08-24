@@ -1,5 +1,13 @@
 # llama.cpp
 
+> [!NOTE]
+> **This is the YawLabs fork of [llama.cpp](https://github.com/ggml-org/llama.cpp).** It adds an
+> experimental **QNN backend** for the Qualcomm Hexagon NPU on Windows on Snapdragon
+> (`-DGGML_QNN=ON`) - see [docs/backend/QNN.md](docs/backend/QNN.md) for status, build
+> instructions and measured results. The backend is a research vehicle, not a production
+> accelerator; everything else in this repository is upstream llama.cpp. Not affiliated with
+> or endorsed by the upstream project.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
