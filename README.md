@@ -21,7 +21,10 @@ Measured on that machine:
   weights (vs ~0.17 TFLOP/s naive per-op execution on the same hardware - the two changes,
   a DCVS TURBO power config worth 2-2.5x and baking weights once in HTP-native layout, are
   together worth up to 64x on deep-K shapes)
-- **45/45** `test-backend-ops` MUL_MAT correctness (F32/F16), clean process exit
+- **45/45** `test-backend-ops` MUL_MAT correctness (F32/F16), clean process exit, plus a
+  dedicated lifecycle suite (`tests/test-qnn-lifecycle.cpp`, 13 registered ctest entries)
+  covering static-weight bakes vs the CPU reference, the memory budget, the failed-shape
+  denylist, watchdog degradation, and the shared-memory IO path
 - **No hangs on real models**: every shape is built, finalized and test-executed before the
   backend claims it; shapes the HTP rejects or that wedge it land in an in-process denylist
   (persisted across runs when `GGML_QNN_DENYLIST` points at a file) and run on the CPU
@@ -30,6 +33,10 @@ Measured on that machine:
 - Quantized weights (Q4/Q5/...) enter the NPU path by being dequantized to fp16 once at bake
   time, within a memory budget (default 2048 MB); one padded graph per weight serves every
   prompt length
+- **A characterized failure law instead of a mystery**: graph execute hangs when a padded IO
+  buffer crosses a runtime-dependent size threshold (~1-1.5 MB measured), and works at any
+  weight size below it - model-scale bakes (512x2560) pass with a small pad bucket
+  (`GGML_QNN_NPAD=64`). See the docs for the tuning guidance
 - Composes with the other backends in one binary: KleidiAI CPU + Adreno GPU (OpenCL) + NPU
 
 What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end on dense 9-14B
