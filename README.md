@@ -8,6 +8,35 @@
 > accelerator; everything else in this repository is upstream llama.cpp. Not affiliated with
 > or endorsed by the upstream project.
 
+## What this fork adds
+
+An experimental ggml backend (`ggml/src/ggml-qnn/`) that runs matmuls on the Hexagon NPU
+through QNN (Qualcomm AI Engine Direct) on Windows ARM64 - no test-signing, no custom DSP
+kernels, only the QAIRT community SDK headers at build time and `QnnHtp.dll` at run time.
+Developed and measured on a Snapdragon X Elite (X1E80100, HTP v73).
+
+Measured on that machine:
+
+- **6-11 TFLOP/s fp16** single-matmul kernel throughput with burst clocks + static-baked
+  weights (vs ~0.17 TFLOP/s naive per-op execution on the same hardware - the two changes
+  are a 2-2.5x DCVS TURBO power config and baking weights once in HTP-native layout, up to
+  64x on deep-K shapes)
+- **45/45** `test-backend-ops` MUL_MAT correctness (F32/F16), clean process exit
+- **No hangs on real models**: every shape is built, finalized and test-executed before the
+  backend claims it; shapes the HTP rejects or that wedge it land in a persistent denylist
+  and run on the CPU instead. Configurations that previously wedged the machine now complete
+  with graceful fallback
+- Quantized weights (Q4/Q5/...) enter the NPU path by being dequantized to fp16 once at bake
+  time, within a memory budget (default 2048 MB); one padded graph per weight serves every
+  prompt length
+- Composes with the other backends in one binary: KleidiAI CPU + Adreno GPU (OpenCL) + NPU
+
+What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end on dense 9-14B
+models - per-op scheduling and IO copies currently eat the kernel advantage, and decode is
+bandwidth-bound on the shared LPDDR5x so the NPU is not claimed for it. The measured case
+for fixing this with ahead-of-time compiled context binaries (a serialized context reloads
+~8x faster than a fresh finalize) is in [docs/backend/QNN.md](docs/backend/QNN.md).
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
