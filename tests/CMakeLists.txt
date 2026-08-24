@@ -165,6 +165,27 @@ if (GGML_QNN)
     set_tests_properties(test-qnn-watchdog PROPERTIES
         PASS_REGULAR_EXPRESSION "WATCHDOG-CHECKS-PASSED|skipping")
 
+    # green guard for the working side of the padded-IO-size law, plus bucket-boundary
+    # rounding, the exact-pow2 bucket branch, and the NO_OPT lever on a passing graph
+    llama_test(test-qnn-lifecycle NAME test-qnn-modelscale       ARGS modelscale)
+    llama_test(test-qnn-lifecycle NAME test-qnn-modelscale-npad0 ARGS modelscale 0)
+    llama_test(test-qnn-lifecycle NAME test-qnn-noopt            ARGS modelscale)
+    set_tests_properties(test-qnn-modelscale test-qnn-modelscale-npad0 test-qnn-noopt
+        PROPERTIES RUN_SERIAL TRUE)
+    set_tests_properties(test-qnn-noopt PROPERTIES
+        ENVIRONMENT "GGML_QNN_NO_OPT=1")
+
+    # config-surface guards: the A/B kill-switch, the default min-dim gate, single-bake
+    # across batch sizes, and the rpcmem shared-memory IO path
+    llama_test(test-qnn-lifecycle NAME test-qnn-disable        ARGS disable)
+    llama_test(test-qnn-lifecycle NAME test-qnn-mindim         ARGS mindim)
+    llama_test(test-qnn-lifecycle NAME test-qnn-rebake         ARGS rebake)
+    llama_test(test-qnn-lifecycle NAME test-qnn-modelscale-shm ARGS modelscale)
+    set_tests_properties(test-qnn-disable test-qnn-mindim test-qnn-rebake test-qnn-modelscale-shm
+        PROPERTIES RUN_SERIAL TRUE)
+    set_tests_properties(test-qnn-modelscale-shm PROPERTIES
+        ENVIRONMENT "GGML_QNN_SHARED_MEM=1")
+
     # --list-devices must produce output: a backend-DLL teardown crash used to destroy
     # the buffered stdout before the CRT flushed it, exiting 0 with zero bytes
     llama_test_cmd(

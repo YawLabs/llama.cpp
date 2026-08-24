@@ -17,6 +17,22 @@
 //                                 returning because the leaked degraded session can crash the
 //                                 process during exit (known teardown behavior) - key off the
 //                                 marker, not the exit code
+//   test-qnn-lifecycle bigstatic [i]   diagnostic, NOT a gate (no ctest entry): 512-class
+//                                 static bakes that discriminate the padded-IO-size hang
+//                                 thresholds. optional case index i runs a single case, for
+//                                 order/isolation permutations
+//   test-qnn-lifecycle modelscale [npad]   green guard for the WORKING side of the IO-size
+//                                 law: model-scale static bake at a small pad bucket plus
+//                                 bucket-boundary correctness; npad defaults to 64, "0" pins
+//                                 the exact-pow2 bucket branch. run under GGML_QNN_SHARED_MEM=1
+//                                 (the -shm ctest variant) it covers the rpcmem IO path too
+//   test-qnn-lifecycle disable    GGML_QNN_DISABLE=1 must remove the device entirely (the
+//                                 A/B kill-switch; vacuous pass on machines with no HTP)
+//   test-qnn-lifecycle mindim     at DEFAULT env the min-dim gate refuses small matmuls
+//                                 while claiming normal ones
+//   test-qnn-lifecycle rebake     one weight probed at two N in the same pad bucket bakes
+//                                 once: the budget is sized so a per-N re-bake regression
+//                                 (the original NPU-memory-exhaustion failure) fails the test
 //
 // NOTE: run modes one at a time, and never concurrently with another NPU-using process (the
 // HTP is single-client and can wedge).
@@ -341,6 +357,184 @@ static int scenario_denylist(void) {
     return g_failures ? 1 : 0;
 }
 
+// the padded-IO size law: static-bake graphs hang at execute when a padded IO buffer crosses
+// a runtime-dependent threshold (~1.5MB out on QAIRT 2.34, lower on 2.45), and work at any
+// weight size below it. this mode guards the WORKING side and is safe to gate on:
+// model-scale bake at a small pad bucket + correctness across bucket boundaries.
+// the optional npad argument (main) feeds GGML_QNN_NPAD; "0" pins the exact-pow2 branch
+static int scenario_modelscale(void) {
+    printf("scenario: modelscale (GGML_QNN_NPAD=%s)\n", getenv("GGML_QNN_NPAD"));
+    ggml_backend_t qnn = qnn_backend_init();
+    ggml_backend_t cpu = cpu_backend_init();
+    check(qnn != nullptr, "QNN backend initializes");
+    check(cpu != nullptr, "CPU backend initializes");
+    if (!qnn || !cpu) {
+        return 1;
+    }
+
+    // guard: a model-scale weight bakes and computes below the IO-size threshold; boundary
+    // cases: N at, just above, and far below the 64 bucket exercise the rounding paths
+    const mul_mat_case cases[] = {
+        { GGML_TYPE_F16, 512, 2560, 64 }, // model-scale guard (out 640KB at bucket 64)
+        { GGML_TYPE_F16, 256,  256, 64 }, // N == bucket
+        { GGML_TYPE_F16, 256,  256, 65 }, // N one past the bucket -> next pow2 bucket
+        { GGML_TYPE_F16, 256,  256,  3 }, // tiny N; with NPAD=0 pins the exact-pow2 branch
+    };
+    bool prior_failure = false;
+    for (const auto & c : cases) {
+        bool claimed = false;
+        std::vector<float> got, ref;
+        const bool ok_q = run_mul_mat(qnn, c, got, &claimed);
+        const bool ok_c = run_mul_mat(cpu, c, ref);
+        char msg[192];
+        const char * caveat = prior_failure ? " [NOT independent: session may be degraded by the earlier failure]" : "";
+        snprintf(msg, sizeof(msg), "static %" PRId64 "x%" PRId64 " N=%" PRId64 " claimed, computes, matches CPU%s",
+                 c.K, c.M, c.N, caveat);
+        const bool ok = claimed && ok_q && ok_c && nmse(ref, got) < 5e-4;
+        check(ok, msg);
+        if (!ok) {
+            prior_failure = true;
+        }
+    }
+
+    ggml_backend_free(qnn);
+    ggml_backend_free(cpu);
+    return g_failures ? 1 : 0;
+}
+
+// 512-class static bakes were seen hanging at validation execute on the QAIRT 2.45 runtime
+// on battery while the 256-class worked. this mode is the discriminator: run it on AC - a
+// clean pass isolates battery power limiting as the cause, a hang implicates the runtime.
+// a failed case degrades the session, so later cases in the same process are not
+// independent results; case_idx >= 0 runs one case alone for order/isolation permutations
+static int scenario_bigstatic(int case_idx) {
+    printf("scenario: bigstatic%s\n", case_idx >= 0 ? " (single case)" : "");
+    ggml_backend_t qnn = qnn_backend_init();
+    ggml_backend_t cpu = cpu_backend_init();
+    check(qnn != nullptr, "QNN backend initializes");
+    check(cpu != nullptr, "CPU backend initializes");
+    if (!qnn || !cpu) {
+        return 1;
+    }
+
+    const mul_mat_case cases[] = {
+        { GGML_TYPE_F16, 512,  512, 64 },
+        { GGML_TYPE_F16, 512,  768, 64 }, // non-pow2 M, hangs on 2.34 and 2.45
+        { GGML_TYPE_F16, 512, 1024, 64 }, // pow2 M larger than the failing 768
+        { GGML_TYPE_F16, 512,  640, 64 }, // non-pow2 M smaller than the failing 768
+        { GGML_TYPE_F16, 512, 2560, 64 }, // model-scale M; passes at small pad buckets if the
+                                          // hang follows padded IO size (run with GGML_QNN_NPAD=64)
+    };
+    const int n_cases = (int) (sizeof(cases) / sizeof(cases[0]));
+    if (case_idx >= n_cases) {
+        fprintf(stderr, "bigstatic: case index %d out of range (0..%d)\n", case_idx, n_cases - 1);
+        return 1;
+    }
+
+    bool prior_failure = false;
+    for (int i = 0; i < n_cases; i++) {
+        if (case_idx >= 0 && i != case_idx) {
+            continue;
+        }
+        const mul_mat_case & c = cases[i];
+        bool claimed = false;
+        std::vector<float> got, ref;
+        const bool ok_q = run_mul_mat(qnn, c, got, &claimed);
+        const bool ok_c = run_mul_mat(cpu, c, ref);
+        char msg[192];
+        const char * caveat = prior_failure ? " [NOT independent: session may be degraded by the earlier failure]" : "";
+        snprintf(msg, sizeof(msg), "static bake %" PRId64 "x%" PRId64 " claimed%s", c.K, c.M, caveat);
+        check(claimed, msg);
+        if (claimed) {
+            snprintf(msg, sizeof(msg), "static bake %" PRId64 "x%" PRId64 " computes and matches CPU%s", c.K, c.M, caveat);
+            check(ok_q && ok_c && nmse(ref, got) < 5e-4, msg);
+        }
+        if (!claimed || !ok_q) {
+            prior_failure = true;
+        }
+    }
+
+    ggml_backend_free(qnn);
+    ggml_backend_free(cpu);
+    return g_failures ? 1 : 0;
+}
+
+// the A/B kill-switch: GGML_QNN_DISABLE (set by main before any registry use) must remove
+// the device entirely. on a machine with no HTP this passes vacuously - acceptable, since
+// the assertion is absence
+static int scenario_disable(void) {
+    printf("scenario: disable\n");
+    check(ggml_backend_dev_by_name("QNN") == nullptr, "GGML_QNN_DISABLE removes the QNN device");
+    return g_failures ? 1 : 0;
+}
+
+// default-env gate: with GGML_QNN_MIN_DIM unset (default 32), small matmuls must be refused
+// (they are memory-bound and belong on the CPU) while normal shapes are still claimed
+static int scenario_mindim(void) {
+    printf("scenario: mindim (default env)\n");
+    ggml_backend_t qnn = qnn_backend_init();
+    check(qnn != nullptr, "QNN backend initializes");
+    if (!qnn) {
+        return 1;
+    }
+
+    const mul_mat_case small = { GGML_TYPE_F16, 16, 16, 8 };
+    check(!probe_claim(qnn, small), "16x16 matmul refused at the default min-dim gate");
+
+    const mul_mat_case normal = { GGML_TYPE_F16, 256, 128, 64 };
+    check(probe_claim(qnn, normal), "256x128 matmul still claimed at default env");
+
+    ggml_backend_free(qnn);
+    return g_failures ? 1 : 0;
+}
+
+// one weight probed at two batch sizes inside the same pad bucket must bake ONCE: the graph
+// key is (padded shape, weight address), so both probes share a graph. the budget (2 MB) fits
+// exactly one bake of the 1.125 MB weight - a per-N re-bake regression (the failure that
+// originally exhausted NPU memory) makes the second probe over-budget and fails the test.
+// the weight stays alive across both probes so its address cannot be reused
+static int scenario_rebake(void) {
+    printf("scenario: rebake\n");
+    ggml_backend_t qnn = qnn_backend_init();
+    check(qnn != nullptr, "QNN backend initializes");
+    if (!qnn) {
+        return 1;
+    }
+
+    const int64_t K = 768, M = 768;
+    ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
+    ggml_init_params gp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_context * ctx   = ggml_init(gp);
+
+    ggml_tensor * w  = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F16, K, M);
+    ggml_tensor * x1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 8);  // pad bucket 64
+    ggml_tensor * x2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 50); // same bucket
+    ggml_tensor * d1 = ggml_mul_mat(ctx, w, x1);
+    ggml_tensor * d2 = ggml_mul_mat(ctx, w, x2);
+
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, qnn);
+    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, qnn);
+
+    std::vector<float> wf((size_t) K * M);
+    fill_uniform(wf, 7);
+    std::vector<ggml_fp16_t> wh(wf.size());
+    ggml_fp32_to_fp16_row(wf.data(), wh.data(), (int64_t) wf.size());
+    ggml_backend_tensor_set(w, wh.data(), 0, wh.size() * sizeof(ggml_fp16_t));
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(qnn);
+    check(ggml_backend_dev_supports_op(dev, d1), "first N in the bucket claimed (bakes the weight)");
+    check(ggml_backend_dev_supports_op(dev, d2), "second N in the same bucket claimed without a re-bake");
+
+    ggml_backend_buffer_free(buf);
+    ggml_backend_buffer_free(buf_w);
+    ggml_free(ctx);
+    ggml_free(ctx_w);
+    ggml_backend_free(qnn);
+    return g_failures ? 1 : 0;
+}
+
 static int scenario_watchdog(void) {
     printf("scenario: watchdog\n");
     ggml_backend_t qnn = qnn_backend_init();
@@ -378,8 +572,11 @@ int main(int argc, char ** argv) {
 
     // the backend latches env at first use, so all setup happens before the registry is touched
     const char * dl_path = "test-qnn-lifecycle-denylist.tmp";
-    if (mode == "basic") {
+    if (mode == "basic" || mode == "bigstatic") {
         set_env("GGML_QNN_MIN_DIM", "1");
+    } else if (mode == "modelscale") {
+        set_env("GGML_QNN_MIN_DIM", "1");
+        set_env("GGML_QNN_NPAD", argc > 2 ? argv[2] : "64");
     } else if (mode == "budget") {
         remove(dl_path);
         set_env("GGML_QNN_STATIC_BUDGET_MB", "1");
@@ -397,12 +594,21 @@ int main(int argc, char ** argv) {
         fclose(f);
     } else if (mode == "watchdog") {
         set_env("GGML_QNN_TIMEOUT_MS", "1");
+    } else if (mode == "disable") {
+        set_env("GGML_QNN_DISABLE", "1");
+    } else if (mode == "mindim") {
+        // deliberately no env: the point is the DEFAULT gate
+    } else if (mode == "rebake") {
+        set_env("GGML_QNN_MIN_DIM", "1");
+        set_env("GGML_QNN_NPAD", "64");
+        set_env("GGML_QNN_STATIC_BUDGET_MB", "2");
     } else {
-        fprintf(stderr, "unknown mode %s (basic|budget|denylist|watchdog)\n", mode.c_str());
+        fprintf(stderr, "unknown mode %s (basic|budget|denylist|watchdog|bigstatic|modelscale|disable|mindim|rebake)\n", mode.c_str());
         return 1;
     }
 
-    if (!ggml_backend_dev_by_name("QNN")) {
+    // the disable scenario asserts ABSENCE, so it must not be skipped by the availability check
+    if (mode != "disable" && !ggml_backend_dev_by_name("QNN")) {
         printf("QNN device not available (no HTP or QnnHtp.dll not found) - skipping\n");
         return 0;
     }
@@ -416,6 +622,16 @@ int main(int argc, char ** argv) {
         rc = scenario_denylist();
     } else if (mode == "watchdog") {
         rc = scenario_watchdog();
+    } else if (mode == "bigstatic") {
+        rc = scenario_bigstatic(argc > 2 ? atoi(argv[2]) : -1);
+    } else if (mode == "modelscale") {
+        rc = scenario_modelscale();
+    } else if (mode == "disable") {
+        rc = scenario_disable();
+    } else if (mode == "mindim") {
+        rc = scenario_mindim();
+    } else if (mode == "rebake") {
+        rc = scenario_rebake();
     }
 
     if (mode == "budget" || mode == "denylist") {
