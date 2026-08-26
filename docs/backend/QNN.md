@@ -18,8 +18,8 @@ time and `QnnHtp.dll` at run time.
 | `test-backend-ops` MUL_MAT (F32/F16 weights) | 45/45 pass |
 | Single-matmul kernel throughput (burst clocks + static weights) | 6-11 TFLOP/s fp16, measured |
 | Real-model inference | completes, no hangs; unsupported shapes fall back to the CPU automatically |
-| End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | currently loses on dense 9-14B models |
-| Decode (single-token) offload | intentionally not claimed (bandwidth-bound, the CPU is better placed) |
+| End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | loses to both, measured on a 4B and on dense 9-14B models (see Measured comparison) |
+| Decode (single-token) offload | intentionally not claimed; it runs on the CPU, though the Adreno is 25% faster at it (see Measured comparison) |
 
 The honest summary: the kernels are fast, the eager per-op execution model is robust,
 but per-op scheduling and IO copies eat the advantage on real models. The practical value
@@ -28,6 +28,34 @@ failed-shape denylist, watchdog with clean CPU fallback), (b) the measured evide
 compile-once/load-fast AOT context binaries are the right next step (a serialized context
 reloads ~8x faster than a fresh finalize: ~5 ms vs ~41 ms measured), and (c) a bounded static-weight path that bakes
 quantized weights to fp16 on the NPU within a memory budget.
+
+## Measured comparison
+
+Qwen3-4B-Q4_K_M (2.32 GiB) on a Snapdragon X Elite (X1E80100), Windows 11 ARM64, AC power,
+`llama-bench -t 6 -p 512 -n 128 -r 5`, one build per backend from the same commit. The NPU
+leg runs `-ub 64` with `GGML_QNN_NPAD=64`.
+
+| Backend | pp512 t/s | tg128 t/s |
+|---|---:|---:|
+| Adreno X1-85 (OpenCL) | 227.4 | 20.0 |
+| CPU (KleidiAI) | 116.4 | 16.0 |
+| Hexagon NPU (QNN) | 101.5 | 15.8 |
+
+The GPU takes prefill by 1.95x over the CPU and 2.24x over the NPU, and takes decode by 25%.
+The NPU loses prefill to the CPU by 15%. NPU decode matches the CPU because the backend does
+not claim decode - that leg is the CPU path with the QNN backend registered.
+
+NPU prefill is also the noisiest number here: 21% relative stddev between repetitions against
+0.4% for the GPU, while the two run means agree to 1.3%. Per-op scheduling and first-hit bake
+sit on the critical path, which is the case for AOT context binaries.
+
+The decode numbers correct an earlier assumption in this document. If decode were simply
+bandwidth-bound on the shared LPDDR5x, every engine would land on the same number; the Adreno
+instead takes it by 25%. Streaming the 2.32 GiB of weights once per token works out to roughly
+50 GB/s for the GPU against 40 GB/s for the CPU, both well short of what LPDDR5x on this part
+can deliver. Decode here is bandwidth-sensitive, not bandwidth-saturated, so the engine still
+matters. The NPU is not claimed for decode and so is not measured for it - that column says
+nothing about what the HTP would do.
 
 ## Requirements
 
@@ -93,11 +121,22 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   generation and makes results noisy (44% vs 7% relative stddev, measured on AC power) -
   decode's per-token threadpool barriers pay for oversubscription, prefill shows no
   comparable collapse. Use about half the cores (`-t 6` on the 12-core X1E80100) for any
-  decode measurement. Battery behavior has not been cleanly measured and may be worse.
+  decode measurement.
 - The NPU is a single-client device: never run two NPU-using processes at once, the HTP
   can wedge and need a device reset.
 - Memory is unified (CPU, GPU and NPU share the same LPDDR5x pool and bandwidth); budget
   accordingly.
+- A back-to-back sweep cannot rank backends on this machine. Repeating the first leg at the
+  end of a four-leg sweep came back 26% low on AC and 43% low on battery, with the clock
+  sliding from 87% to 69% of base across the run. Counterbalance the order (CPU, GPU, NPU,
+  NPU, GPU, CPU) and cool down 120 s between legs, then average each backend's pair; that
+  reproduces every backend within 0.1-3.5%.
+- Battery is not just slower, it is differently shaped. A position-matched pass on DC
+  measured the GPU 1.6x down but the NPU 3.5x down (pp512 27.7 vs 95.8 t/s). Measure on AC.
+- Throughput cannot tell you which engine ran. Verify GPU placement with PID-filtered
+  `\GPU Engine(*)\Utilization Percentage` (about 95% under load against a ~2% idle
+  baseline); `--device`, `--list-devices` and reported free memory have all failed to catch
+  a silent CPU fallback.
 
 ## Known limitations
 
