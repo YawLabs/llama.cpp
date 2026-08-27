@@ -85,6 +85,9 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
 - `supports_op` builds, finalizes and test-executes a QNN graph for every new shape
   before claiming it, so inference only ever runs graphs proven to execute. Shapes the
   HTP rejects or that wedge it are denylisted and permanently routed to the CPU.
+  Weights probed before their data is resident (llama's model-load pass) are answered
+  from the type and shape policy alone - a trial build needs the real bytes - and the
+  HTP trial happens on the first scheduled node instead.
 - Model weights are baked into their graphs once (dequantized to fp16 when quantized) in
   HTP-native layout, within a memory budget (default 2048 MB). Weights past the budget
   stay on the CPU. The first time a shape is seen it pays graph build + finalize + bake

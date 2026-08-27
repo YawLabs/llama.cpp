@@ -160,31 +160,44 @@ if (GGML_QNN)
     llama_test(test-qnn-lifecycle NAME test-qnn-budget   ARGS budget)
     llama_test(test-qnn-lifecycle NAME test-qnn-denylist ARGS denylist)
     llama_test(test-qnn-lifecycle NAME test-qnn-watchdog ARGS watchdog)
-    set_tests_properties(test-qnn-basic test-qnn-budget test-qnn-denylist test-qnn-watchdog
-        PROPERTIES RUN_SERIAL TRUE)
-    set_tests_properties(test-qnn-watchdog PROPERTIES
-        PASS_REGULAR_EXPRESSION "WATCHDOG-CHECKS-PASSED|skipping")
 
     # green guard for the working side of the padded-IO-size law, plus bucket-boundary
-    # rounding, the exact-pow2 bucket branch, and the NO_OPT lever on a passing graph
+    # rounding, the exact-pow2 bucket branch, and the NO_OPT lever on a passing graph.
+    # the third ARG names the env var the runner must have set: the -noopt and -shm
+    # variants are otherwise byte-identical invocations of test-qnn-modelscale
     llama_test(test-qnn-lifecycle NAME test-qnn-modelscale       ARGS modelscale)
     llama_test(test-qnn-lifecycle NAME test-qnn-modelscale-npad0 ARGS modelscale 0)
-    llama_test(test-qnn-lifecycle NAME test-qnn-noopt            ARGS modelscale)
-    set_tests_properties(test-qnn-modelscale test-qnn-modelscale-npad0 test-qnn-noopt
-        PROPERTIES RUN_SERIAL TRUE)
-    set_tests_properties(test-qnn-noopt PROPERTIES
-        ENVIRONMENT "GGML_QNN_NO_OPT=1")
+    llama_test(test-qnn-lifecycle NAME test-qnn-noopt            ARGS modelscale 64 GGML_QNN_NO_OPT)
 
     # config-surface guards: the A/B kill-switch, the default min-dim gate, single-bake
     # across batch sizes, and the rpcmem shared-memory IO path
     llama_test(test-qnn-lifecycle NAME test-qnn-disable        ARGS disable)
     llama_test(test-qnn-lifecycle NAME test-qnn-mindim         ARGS mindim)
     llama_test(test-qnn-lifecycle NAME test-qnn-rebake         ARGS rebake)
-    llama_test(test-qnn-lifecycle NAME test-qnn-modelscale-shm ARGS modelscale)
-    set_tests_properties(test-qnn-disable test-qnn-mindim test-qnn-rebake test-qnn-modelscale-shm
-        PROPERTIES RUN_SERIAL TRUE)
-    set_tests_properties(test-qnn-modelscale-shm PROPERTIES
-        ENVIRONMENT "GGML_QNN_SHARED_MEM=1")
+    llama_test(test-qnn-lifecycle NAME test-qnn-modelscale-shm ARGS modelscale 64 GGML_QNN_SHARED_MEM)
+
+    # default-env correctness gates: the elementwise opt-in must stay off (the HTP has a
+    # known Add broadcast bug), and supports_op must not change its verdict between the
+    # unallocated probe llama does at model load and the resident one at schedule time
+    llama_test(test-qnn-lifecycle NAME test-qnn-elementwise ARGS elementwise)
+    llama_test(test-qnn-lifecycle NAME test-qnn-loadprobe   ARGS loadprobe)
+
+    set_tests_properties(test-qnn-noopt            PROPERTIES ENVIRONMENT "GGML_QNN_NO_OPT=1")
+    set_tests_properties(test-qnn-modelscale-shm   PROPERTIES ENVIRONMENT "GGML_QNN_SHARED_MEM=1")
+
+    # SKIP_RETURN_CODE: the test exits 77 when no HTP is present. Without it every entry
+    # returned 0 and the whole suite reported green on hardware that never ran QNN code.
+    # test-qnn-watchdog is judged by its output marker instead of its exit code (the
+    # deliberately leaked degraded session can crash during exit), so on a machine with no
+    # HTP it fails loudly rather than skipping - the safe direction.
+    set_tests_properties(
+        test-qnn-basic test-qnn-budget test-qnn-denylist test-qnn-watchdog
+        test-qnn-modelscale test-qnn-modelscale-npad0 test-qnn-noopt
+        test-qnn-disable test-qnn-mindim test-qnn-rebake test-qnn-modelscale-shm
+        test-qnn-elementwise test-qnn-loadprobe
+        PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+    set_tests_properties(test-qnn-watchdog PROPERTIES
+        PASS_REGULAR_EXPRESSION "WATCHDOG-CHECKS-PASSED")
 
     # --list-devices must produce output: a backend-DLL teardown crash used to destroy
     # the buffered stdout before the CRT flushed it, exiting 0 with zero bytes

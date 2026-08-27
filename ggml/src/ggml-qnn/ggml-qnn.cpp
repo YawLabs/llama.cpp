@@ -285,6 +285,16 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
             return false;
     }
 
+    // llama probes every weight at model load, before the data is resident: src0->data is
+    // NULL and the buffer is not tagged WEIGHTS yet. A trial build needs the real bytes, so
+    // answer from the type and shape policy above and leave the HTP trial to the first
+    // scheduled node. Building here asked a different question than schedule time - a
+    // quantized weight was refused at load and claimed at run - and cached a finalized
+    // dynamic-variant graph for a shape inference never executes
+    if (op->op == GGML_OP_MUL_MAT && src0->data == nullptr) {
+        return true;
+    }
+
     // the HTP can reject shapes at graph-finalize time (e.g. TCM tiling limits) and can wedge
     // at execute time, so claim an op only after its graph builds AND test-executes, the
     // result is cached with the graph. hold a ref so a concurrent backend free cannot tear

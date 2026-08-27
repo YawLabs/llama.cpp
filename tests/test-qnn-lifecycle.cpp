@@ -30,6 +30,11 @@
 //                                 A/B kill-switch; vacuous pass on machines with no HTP)
 //   test-qnn-lifecycle mindim     at DEFAULT env the min-dim gate refuses small matmuls
 //                                 while claiming normal ones
+//   test-qnn-lifecycle elementwise  at DEFAULT env ADD/MUL must be refused (the HTP has a
+//                                 known broadcast bug), while mul_mat is still claimed
+//   test-qnn-lifecycle loadprobe  supports_op must give the same verdict for a weight
+//                                 probed unallocated (data == NULL, no WEIGHTS usage, as
+//                                 llama does at model load) as for the resident, tagged one
 //   test-qnn-lifecycle rebake     one weight probed at two N in the same pad bucket bakes
 //                                 once: the budget is sized so a per-N re-bake regression
 //                                 (the original NPU-memory-exhaustion failure) fails the test
@@ -52,6 +57,9 @@
 
 static int g_checks = 0;
 static int g_failures = 0;
+
+// set by modes whose ctest variant differs ONLY by an ENVIRONMENT property
+static const char * g_require_env = nullptr;
 
 static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
@@ -308,8 +316,11 @@ static int scenario_budget(void) {
     // f16 weight of 4 MiB against a 1 MiB budget: refused as policy, never denylisted
     const mul_mat_case big = { GGML_TYPE_F16, 2048, 1024, 64 };
     check(!probe_claim(qnn, big), "over-budget weight is refused");
-    const long dl_size = dl ? file_size(dl) : -1;
-    check(dl_size <= 0, "policy reject did not touch the denylist file");
+    check(dl != nullptr, "denylist path is configured for this scenario");
+    // file_size returns -1 absent and 0 empty; assert the file was never CREATED, so that
+    // deleting denylist-writing entirely cannot make this check greener instead of redder
+    const long dl_size = dl ? file_size(dl) : 0;
+    check(dl_size < 0, "policy reject did not create the denylist file");
 
     // 20 distinct 64 KiB weights against the 1 MiB budget: exactly 16 fit. shapes stay in
     // the 256-class deliberately - 512x512-and-up static bakes were seen hanging at
@@ -488,6 +499,97 @@ static int scenario_mindim(void) {
     return g_failures ? 1 : 0;
 }
 
+// ADD/MUL must stay refused at default env. The HTP returns wrong results for some Add
+// broadcast shapes, so the GGML_QNN_ELEMENTWISE opt-in is the only thing keeping them off
+// real models: a regression that dropped the gate would corrupt output silently while every
+// other test stayed green
+static bool probe_binary_claim(ggml_backend_t backend, bool use_add, int64_t K, int64_t N) {
+    ggml_init_params gp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * d = use_add ? ggml_add(ctx, a, b) : ggml_mul(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> f((size_t) K * N);
+    fill_uniform(f, 3);
+    ggml_backend_tensor_set(a, f.data(), 0, f.size() * sizeof(float));
+    fill_uniform(f, 5);
+    ggml_backend_tensor_set(b, f.data(), 0, f.size() * sizeof(float));
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    const bool claimed = ggml_backend_dev_supports_op(dev, d);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return claimed;
+}
+
+static int scenario_elementwise(void) {
+    printf("scenario: elementwise (default env)\n");
+    ggml_backend_t qnn = qnn_backend_init();
+    check(qnn != nullptr, "QNN backend initializes");
+    if (!qnn) {
+        return 1;
+    }
+
+    // 2M elements clears the default GGML_QNN_MIN_ELEMENTS (1M), so a refusal here is the
+    // ELEMENTWISE gate itself and not the size threshold
+    const int64_t K = 2048, N = 1024;
+    check(!probe_binary_claim(qnn, true,  K, N), "ADD refused with GGML_QNN_ELEMENTWISE unset");
+    check(!probe_binary_claim(qnn, false, K, N), "MUL refused with GGML_QNN_ELEMENTWISE unset");
+
+    // the matmul path must be unaffected by the elementwise gate
+    const mul_mat_case normal = { GGML_TYPE_F16, 256, 128, 64 };
+    check(probe_claim(qnn, normal), "mul_mat still claimed at default env");
+
+    ggml_backend_free(qnn);
+    return g_failures ? 1 : 0;
+}
+
+// llama's model loader probes supports_op for every weight BEFORE the data is resident: the
+// weight sits in a no_alloc context, so data is NULL and its buffer is not tagged WEIGHTS.
+// That verdict must match the one taken at schedule time on the same resident, tagged weight
+// - otherwise the backend either claims a shape it will refuse later, or finalizes and
+// permanently caches a dynamic-variant graph for a shape real inference never executes
+static int scenario_loadprobe(void) {
+    printf("scenario: loadprobe\n");
+    ggml_backend_t qnn = qnn_backend_init();
+    check(qnn != nullptr, "QNN backend initializes");
+    if (!qnn) {
+        return 1;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(qnn);
+
+    const int64_t K = 256, M = 128, N = 64;
+    const ggml_type wtypes[] = { GGML_TYPE_F16, GGML_TYPE_Q4_0 };
+
+    for (ggml_type wt : wtypes) {
+        // load-time shape: weight never allocated, so data == NULL and no WEIGHTS usage tag
+        ggml_init_params gp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, wt, K, M);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+        ggml_tensor * d = ggml_mul_mat(ctx, w, x);
+        const bool claim_load = ggml_backend_dev_supports_op(dev, d);
+        ggml_free(ctx);
+
+        // schedule-time shape: same dims, resident data, buffer tagged WEIGHTS
+        const mul_mat_case c = { wt, K, M, N };
+        const bool claim_sched = probe_claim(qnn, c);
+
+        char msg[176];
+        snprintf(msg, sizeof(msg), "%s supports_op agrees load-time vs schedule-time (load=%d sched=%d)",
+                 ggml_type_name(wt), (int) claim_load, (int) claim_sched);
+        check(claim_load == claim_sched, msg);
+    }
+
+    ggml_backend_free(qnn);
+    return g_failures ? 1 : 0;
+}
+
 // one weight probed at two batch sizes inside the same pad bucket must bake ONCE: the graph
 // key is (padded shape, weight address), so both probes share a graph. the budget (2 MB) fits
 // exactly one bake of the 1.125 MB weight - a per-N re-bake regression (the failure that
@@ -552,6 +654,12 @@ static int scenario_watchdog(void) {
     const mul_mat_case c2 = { GGML_TYPE_F16, 128, 64, 64 };
     check(!probe_claim(qnn, c2), "degraded session refuses further shapes");
 
+    // a timed-out shape is a genuine failure and must be PERSISTED so a rerun after a wedge
+    // skips it. this is the only check that exercises the file-append branch
+    const char * dl = getenv("GGML_QNN_DENYLIST");
+    check(dl != nullptr, "denylist path is configured for this scenario");
+    check(dl && file_size(dl) > 0, "timed-out shape was appended to the denylist file");
+
     // the backend must keep initializing (llama_new_context must not fail hard)
     ggml_backend_t qnn2 = qnn_backend_init();
     check(qnn2 != nullptr, "backend init still succeeds after degrade");
@@ -577,6 +685,11 @@ int main(int argc, char ** argv) {
     } else if (mode == "modelscale") {
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_NPAD", argc > 2 ? argv[2] : "64");
+        // the -noopt and -shm variants pass the same args and differ only by a ctest
+        // ENVIRONMENT property; naming it here makes broken wiring fail the test
+        if (argc > 3) {
+            g_require_env = argv[3];
+        }
     } else if (mode == "budget") {
         remove(dl_path);
         set_env("GGML_QNN_STATIC_BUDGET_MB", "1");
@@ -593,24 +706,37 @@ int main(int argc, char ** argv) {
         fprintf(f, "MUL_MAT_f16_f32_256x64x1x1_256x512x1x1_dyn\n");
         fclose(f);
     } else if (mode == "watchdog") {
+        remove(dl_path);
         set_env("GGML_QNN_TIMEOUT_MS", "1");
+        set_env("GGML_QNN_DENYLIST", dl_path);
     } else if (mode == "disable") {
         set_env("GGML_QNN_DISABLE", "1");
-    } else if (mode == "mindim") {
-        // deliberately no env: the point is the DEFAULT gate
+    } else if (mode == "mindim" || mode == "elementwise" || mode == "loadprobe") {
+        // deliberately no env: the point is behaviour at the DEFAULT configuration
     } else if (mode == "rebake") {
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_NPAD", "64");
         set_env("GGML_QNN_STATIC_BUDGET_MB", "2");
     } else {
-        fprintf(stderr, "unknown mode %s (basic|budget|denylist|watchdog|bigstatic|modelscale|disable|mindim|rebake)\n", mode.c_str());
+        fprintf(stderr, "unknown mode %s (basic|budget|denylist|watchdog|bigstatic|modelscale|disable|mindim|rebake|elementwise|loadprobe)\n", mode.c_str());
         return 1;
     }
 
     // the disable scenario asserts ABSENCE, so it must not be skipped by the availability check
     if (mode != "disable" && !ggml_backend_dev_by_name("QNN")) {
         printf("QNN device not available (no HTP or QnnHtp.dll not found) - skipping\n");
-        return 0;
+        fflush(stdout);
+        // 77 is the ctest SKIP_RETURN_CODE for these entries. Returning 0 here made the
+        // whole suite report green on any machine with no HTP, zero assertions executed
+        return 77;
+    }
+
+    // fail loudly if a variant that exists only for its ctest ENVIRONMENT lost that wiring
+    if (g_require_env) {
+        const char * v = getenv(g_require_env);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "required env %s is set by the test runner", g_require_env);
+        check(v && *v, msg);
     }
 
     int rc = 1;
@@ -632,9 +758,13 @@ int main(int argc, char ** argv) {
         rc = scenario_mindim();
     } else if (mode == "rebake") {
         rc = scenario_rebake();
+    } else if (mode == "elementwise") {
+        rc = scenario_elementwise();
+    } else if (mode == "loadprobe") {
+        rc = scenario_loadprobe();
     }
 
-    if (mode == "budget" || mode == "denylist") {
+    if (mode == "budget" || mode == "denylist" || mode == "watchdog") {
         remove(dl_path);
     }
 
