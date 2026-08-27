@@ -32,8 +32,9 @@ quantized weights to fp16 on the NPU within a memory budget.
 ## Measured comparison
 
 Qwen3-4B-Q4_K_M (2.32 GiB) on a Snapdragon X Elite (X1E80100), Windows 11 ARM64, AC power,
-`llama-bench -t 6 -p 512 -n 128 -r 5`, one build per backend from the same commit
-(`llama-bench` reports build `3f8b30fa5 (10600)`). The NPU leg runs `-ub 64` with
+`llama-bench -t 6 -p 512 -n 128 -r 5`, one build per backend from the same commit. Taken
+before this fork rebased onto upstream, so the numbers predate the current base and the
+commit they were measured at is no longer on master. The NPU leg runs `-ub 64` with
 `GGML_QNN_NPAD=64`.
 
 | Backend | pp512 t/s | tg128 t/s |
@@ -75,6 +76,14 @@ cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_BUILD_TYPE=Release -DGGML_QNN=ON -DQNN_SDK_ROOT=<path-to-qairt>/<version>
 cmake --build build
 ```
+
+This fork carries a build fix the CPU backend needs on Windows ARM64. KleidiAI's assembly
+selects armasm syntax on `_MSC_VER` and GNU syntax otherwise, but clang targeting
+`*-windows-msvc` defines `_MSC_VER` while assembling GNU syntax into COFF, so it matches
+neither branch. Upstream #26077 started compiling those files, which broke the build
+outright. `ggml/src/ggml-cpu/kleidiai/kleidiai-patch-coff-asm.cmake` adds the missing
+branch to the fetched sources at configure time. It is idempotent and becomes a no-op once
+upstream fixes it. Build with `-DGGML_CPU_KLEIDIAI=OFF` to skip the whole question.
 
 The backend composes with the other backends; a combined CPU (KleidiAI) + Adreno GPU
 (OpenCL) + NPU (QNN) binary works. With full GPU offload (`-ngl 99`) the QNN backend is
