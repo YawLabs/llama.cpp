@@ -42,7 +42,7 @@ Measured on that machine:
 What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end on dense 9-14B
 models - per-op scheduling and IO copies currently eat the kernel advantage, and decode is not
 claimed for the NPU, so it runs on the CPU (the Adreno is measurably faster at decode than
-either, so decode is not simply bandwidth-bound as previously stated). The measured case
+the CPU, so decode is not simply bandwidth-bound as previously stated). The measured case
 for fixing this with ahead-of-time compiled context binaries (a serialized context reloads
 ~8x faster than a fresh finalize) is in [docs/backend/QNN.md](docs/backend/QNN.md).
 
