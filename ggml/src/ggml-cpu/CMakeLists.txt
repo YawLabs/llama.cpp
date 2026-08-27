@@ -632,6 +632,20 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             )
         endif()
 
+        # clang targeting *-windows-msvc defines _MSC_VER but assembles GNU syntax into COFF,
+        # so KleidiAI's .S files match neither of their two branches. Add the missing one
+        # before its build system sees them. Idempotent, and re-run so a re-extract is covered
+        if (WIN32)
+            execute_process(
+                COMMAND ${CMAKE_COMMAND} -DKLEIDIAI_SRC=${KLEIDIAI_SRC}
+                        -P ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/kleidiai/kleidiai-patch-coff-asm.cmake
+                RESULT_VARIABLE KLEIDIAI_PATCH_RC
+            )
+            if (NOT KLEIDIAI_PATCH_RC EQUAL 0)
+                message(FATAL_ERROR "kleidiai: COFF assembly patch failed (${KLEIDIAI_PATCH_RC})")
+            endif()
+        endif()
+
         if (NOT TARGET kleidiai)
             add_subdirectory(
                 "${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/kleidiai"
