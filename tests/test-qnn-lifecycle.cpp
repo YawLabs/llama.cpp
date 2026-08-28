@@ -293,6 +293,29 @@ static int scenario_basic(void) {
     return g_failures ? 1 : 0;
 }
 
+// GGML_QNN_STATS counters, written by the backend when the session is freed. Several ctest
+// variants differ from their parent only by an env var, so without these they could not
+// observe whether that env var changed anything and could not fail when it silently did not.
+static const char * g_stats_path = "test-qnn-lifecycle-stats.tmp";
+
+static long long read_stat(const char * key) {
+    FILE * f = fopen(g_stats_path, "r");
+    if (!f) {
+        return -1;
+    }
+    char               name[64];
+    unsigned long long val   = 0;
+    long long          found = -1;
+    while (fscanf(f, "%63s %llu", name, &val) == 2) {
+        if (strcmp(name, key) == 0) {
+            found = (long long) val;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 static long file_size(const char * path) {
     FILE * f = fopen(path, "rb");
     if (!f) {
@@ -408,8 +431,36 @@ static int scenario_modelscale(void) {
         }
     }
 
-    ggml_backend_free(qnn);
+    ggml_backend_free(qnn); // session teardown writes the counters
     ggml_backend_free(cpu);
+
+    // the pad bucket the last case (N=3) actually landed on. this is the only thing that
+    // distinguishes the -npad0 variant from its parent, which were otherwise identical runs
+    const char * npad = getenv("GGML_QNN_NPAD");
+    const long long pad = read_stat("pad_n_last");
+    char m[224];
+    const long long want_pad = (npad && strcmp(npad, "0") == 0) ? 4 : 64;
+    snprintf(m, sizeof(m), "NPAD=%s put the last case on bucket %lld (pad_n_last=%lld)",
+             npad ? npad : "(unset)", want_pad, pad);
+    check(pad == want_pad, m);
+
+    if (g_require_env && strcmp(g_require_env, "GGML_QNN_SHARED_MEM") == 0) {
+        const long long shared   = read_stat("io_shared");
+        const long long fallback = read_stat("io_shm_fallback");
+        if (shared == 0 && fallback == 0) {
+            // neither counter moved: fastrpc is absent, so the block was never entered and
+            // there is no rpcmem path on this device to hold to account
+            printf("fastrpc unavailable - rpcmem IO path not exercised on this device\n");
+        } else {
+            snprintf(m, sizeof(m), "rpcmem IO used for every graph, no silent host fallback "
+                     "(io_shared=%lld io_shm_fallback=%lld)", shared, fallback);
+            check(shared > 0 && fallback == 0, m);
+        }
+    } else if (g_require_env && strcmp(g_require_env, "GGML_QNN_NO_OPT") == 0) {
+        const long long noopt = read_stat("graphs_noopt");
+        snprintf(m, sizeof(m), "no-opt graph config reached graphCreate (graphs_noopt=%lld)", noopt);
+        check(noopt > 0, m);
+    }
     return g_failures ? 1 : 0;
 }
 
@@ -633,7 +684,18 @@ static int scenario_rebake(void) {
     ggml_backend_buffer_free(buf_w);
     ggml_free(ctx);
     ggml_free(ctx_w);
-    ggml_backend_free(qnn);
+    ggml_backend_free(qnn); // session teardown writes the counters
+
+    // asserted directly rather than inferred from the budget: a per-N re-bake used to be
+    // caught only because it exhausted GGML_QNN_STATIC_BUDGET_MB, so a budget change would
+    // have silently retired the check this scenario exists for
+    const long long baked = read_stat("weights_baked");
+    const long long hits  = read_stat("graph_cache_hits");
+    char m[160];
+    snprintf(m, sizeof(m), "weight baked exactly once (weights_baked=%lld)", baked);
+    check(baked == 1, m);
+    snprintf(m, sizeof(m), "second N in the bucket reused the cached graph (graph_cache_hits=%lld)", hits);
+    check(hits >= 1, m);
     return g_failures ? 1 : 0;
 }
 
@@ -683,6 +745,8 @@ int main(int argc, char ** argv) {
     if (mode == "basic" || mode == "bigstatic") {
         set_env("GGML_QNN_MIN_DIM", "1");
     } else if (mode == "modelscale") {
+        remove(g_stats_path);
+        set_env("GGML_QNN_STATS", g_stats_path);
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_NPAD", argc > 2 ? argv[2] : "64");
         // the -noopt and -shm variants pass the same args and differ only by a ctest
@@ -714,6 +778,8 @@ int main(int argc, char ** argv) {
     } else if (mode == "mindim" || mode == "elementwise" || mode == "loadprobe") {
         // deliberately no env: the point is behaviour at the DEFAULT configuration
     } else if (mode == "rebake") {
+        remove(g_stats_path);
+        set_env("GGML_QNN_STATS", g_stats_path);
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_NPAD", "64");
         set_env("GGML_QNN_STATIC_BUDGET_MB", "2");
@@ -766,6 +832,9 @@ int main(int argc, char ** argv) {
 
     if (mode == "budget" || mode == "denylist" || mode == "watchdog") {
         remove(dl_path);
+    }
+    if (mode == "modelscale" || mode == "rebake") {
+        remove(g_stats_path);
     }
 
     printf("%s: %d checks, %d failures\n", mode.c_str(), g_checks, g_failures);

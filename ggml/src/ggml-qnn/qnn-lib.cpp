@@ -34,6 +34,48 @@
 #    include <dlfcn.h>
 #endif
 
+//
+// counters
+//
+
+// GGML_QNN_STATS names a file that receives these counters when the session is freed.
+// They exist because several ctest variants differ from their parent only by an env var
+// and could not observe whether that env var changed anything: test-qnn-rebake asserted a
+// weight was "claimed without a re-bake" while a double bake passed, and -shm and -noopt
+// could not tell an engaged feature from a silent fallback. A file keeps the QNN internals
+// out of the public header and matches how GGML_QNN_DENYLIST is already wired.
+static std::atomic<uint64_t> ggml_qnn_stat_graphs_created{0};
+static std::atomic<uint64_t> ggml_qnn_stat_graph_cache_hits{0};
+static std::atomic<uint64_t> ggml_qnn_stat_weights_baked{0};
+static std::atomic<uint64_t> ggml_qnn_stat_io_shared{0};
+static std::atomic<uint64_t> ggml_qnn_stat_io_host{0};
+static std::atomic<uint64_t> ggml_qnn_stat_io_shm_fallback{0};
+static std::atomic<uint64_t> ggml_qnn_stat_graphs_noopt{0};
+static std::atomic<uint64_t> ggml_qnn_stat_pad_n_last{0};
+
+// written on session teardown; counters are process-global and monotonic, so with a
+// refcounted session the last write is the cumulative total for the run
+static void ggml_qnn_stats_write(void) {
+    const char * path = getenv("GGML_QNN_STATS");
+    if (!path || !*path) {
+        return;
+    }
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        GGML_LOG_ERROR("ggml-qnn: cannot write stats to %s\n", path);
+        return;
+    }
+    fprintf(f, "graphs_created %" PRIu64 "\n", ggml_qnn_stat_graphs_created.load());
+    fprintf(f, "graph_cache_hits %" PRIu64 "\n", ggml_qnn_stat_graph_cache_hits.load());
+    fprintf(f, "weights_baked %" PRIu64 "\n", ggml_qnn_stat_weights_baked.load());
+    fprintf(f, "io_shared %" PRIu64 "\n", ggml_qnn_stat_io_shared.load());
+    fprintf(f, "io_host %" PRIu64 "\n", ggml_qnn_stat_io_host.load());
+    fprintf(f, "io_shm_fallback %" PRIu64 "\n", ggml_qnn_stat_io_shm_fallback.load());
+    fprintf(f, "graphs_noopt %" PRIu64 "\n", ggml_qnn_stat_graphs_noopt.load());
+    fprintf(f, "pad_n_last %" PRIu64 "\n", ggml_qnn_stat_pad_n_last.load());
+    fclose(f);
+}
+
 // page-aligned host buffers for graph IO. kept as allocation hygiene: alignment was ruled
 // out as the cause of the size-threshold execute hang (that follows padded IO transfer size
 // alone - keep max(input, output) under ~1 MB via the pad bucket, see GGML_QNN_NPAD)
@@ -350,6 +392,7 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
 }
 
 void ggml_qnn_session_free(ggml_qnn_session * sess) {
+    ggml_qnn_stats_write();
     if (!sess) {
         return;
     }
@@ -437,6 +480,7 @@ static uint32_t ggml_qnn_pad_n(uint32_t n) {
     while (p < n) {
         p <<= 1;
     }
+    ggml_qnn_stat_pad_n_last.store(p);
     return p;
 }
 
@@ -579,6 +623,7 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
                                   g.bake.data(), (uint32_t) g.bake.size())) {
             return false;
         }
+        ggml_qnn_stat_weights_baked.fetch_add(1);
     } else {
         if (!ggml_qnn_tensor_init(sess, g, w, "in1", QNN_TENSOR_TYPE_APP_WRITE, {M, K}, ggml_qnn_weight_dtype(src0->type))) {
             return false;
@@ -802,8 +847,10 @@ static bool ggml_qnn_graph_setup_io(ggml_qnn_session * sess, ggml_qnn_graph & g,
             g.output.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
             g.output.v1.memHandle = g.mem_output.handle;
             g.shared_mem = true;
+            ggml_qnn_stat_io_shared.fetch_add(1);
             return true;
         }
+        ggml_qnn_stat_io_shm_fallback.fetch_add(1);
         for (auto & b : g.mem_inputs) {
             ggml_qnn_mem_free(&sess->iface, &b);
         }
@@ -831,6 +878,7 @@ static bool ggml_qnn_graph_setup_io(ggml_qnn_session * sess, ggml_qnn_graph & g,
     memset(g.host_output, 0, out_sz);
     g.output.v1.clientBuf.data     = g.host_output;
     g.output.v1.clientBuf.dataSize = (uint32_t) out_sz;
+    ggml_qnn_stat_io_host.fetch_add(1);
     return true;
 }
 
@@ -858,6 +906,7 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
 
     auto it = sess->graphs.find(key);
     if (it != sess->graphs.end()) {
+        ggml_qnn_stat_graph_cache_hits.fetch_add(1);
         return &it->second;
     }
 
@@ -919,6 +968,12 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
         : cfgs_ew;
 
     bool ok        = sess->iface.graphCreate(sess->context_handle, key.c_str(), graph_cfgs, &g.handle) == QNN_SUCCESS;
+    if (ok) {
+        ggml_qnn_stat_graphs_created.fetch_add(1);
+        if (no_opt && node->op == GGML_OP_MUL_MAT) {
+            ggml_qnn_stat_graphs_noopt.fetch_add(1);
+        }
+    }
     bool timed_out = false;
     if (!ok) {
         GGML_LOG_ERROR("ggml-qnn: failed to create graph %s\n", key.c_str());
