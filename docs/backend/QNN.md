@@ -61,6 +61,26 @@ surviving number at 5.5-7.4% relative stddev between repetitions against 0.2-1.3
 Per-op scheduling and first-hit bake sit on the critical path, which is the case for AOT
 context binaries.
 
+**Do not read those pair spreads as the uncertainty on the table.** A pair spread measures
+whether the two legs of ONE run agree with each other. It says nothing about whether a second
+run reproduces the number, and on this machine the two differ by an order of magnitude. The
+same command on a second settled-pack run (CPU-only, not interleaved with the GPU and NPU
+legs) returned CPU pp512 121.88 against 132.15 here - 8.1% apart - and CPU tg128 16.78 against
+22.39 - 28.6% apart - while both runs agreed with themselves to under 2.2%. That comparison
+bounds the figure rather than measuring it cleanly, because the two runs differed in workload
+context as well as in being separate runs.
+
+So quotability is per METRIC, not per run. Prefill at ~8% is defensible from one controlled
+run. Decode is not: quote a range or re-measure across three or more runs.
+
+**Between-run evidence for the GPU and the NPU is thin, and its conditions are unrecorded.**
+Only one settled-pack sample exists for each and this table quotes both from it. There is one
+cross-run comparison available - the superseded table described below - and it points two ways:
+the GPU came back within 0.3% (227.4 then 228.1) while the NPU moved 15.2%, and that NPU
+movement tracks the CPU clock rather than anything about the HTP. But the earlier run's pack
+state was never recorded, so it bounds reproducibility rather than measuring it. No two
+verified-settled sweeps exist, which is not the same as the numbers being fine.
+
 These supersede an earlier table that had the CPU at 116.4 / 16.0 and the NPU at 101.5 / 15.8,
 and that claimed the GPU took decode by 25%. Two things changed. The GPU reproduced to +0.3%,
 but both CPU-thread-bound backends came back higher on prefill - CPU by 13.5%, NPU by 15.2% -
@@ -161,9 +181,13 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   end of a four-leg sweep came back 26% low on AC and 43% low on battery. On the AC run the
   clock slid from 87% to 69% of base across the four legs; on battery, 43% to 33%.
   Counterbalance the order (CPU, GPU, NPU, NPU, GPU, CPU) and cool down 120 s between legs,
-  then average each backend's pair. That reproduces prefill for every backend within 2% and
-  decode for the GPU and NPU within 0.4%. CPU decode does not converge even counterbalanced -
-  a 21% pair spread - so do not quote a single CPU tg128 figure from one sweep.
+  then average each backend's pair. Within one run that brings prefill for every backend
+  inside 2% and GPU/NPU decode inside 0.4%. CPU decode does not converge even counterbalanced
+  - a 21% pair spread - so never quote a single CPU tg128 figure from one sweep. Note what
+  this does and does not buy: pair agreement is WITHIN a run and is not reproduction. A
+  second settled-pack run moved CPU prefill 8.1% and CPU decode 28.6% while each run agreed
+  with itself to under 2.2%, so treat a pair spread as a contamination check, never as the
+  uncertainty on a published number.
 - Battery is not just slower, it is differently shaped. A position-matched pass on DC
   measured the GPU 1.6x down but the NPU 3.5x down (pp512 27.7 vs 95.8 t/s).
 - AC alone is not enough: the pack must also be SETTLED. A deeply discharged pack on AC runs
