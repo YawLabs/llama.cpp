@@ -465,8 +465,12 @@ static int scenario_modelscale(void) {
 }
 
 // 512-class static bakes were seen hanging at validation execute on the QAIRT 2.45 runtime
-// on battery while the 256-class worked. this mode is the discriminator: run it on AC - a
-// clean pass isolates battery power limiting as the cause, a hang implicates the runtime.
+// on battery while the 256-class worked. this mode is the discriminator, but "run it on AC"
+// is NOT a sufficient precondition: a deeply discharged pack on AC runs CPU-bound work at
+// roughly half speed, so an AC hang can be power and be misread as implicating the runtime.
+// run it on AC with a SETTLED pack - above 40% charge, drawing under 5 W - and only then
+// does a clean pass isolate power limiting and a hang implicate the runtime. see the power
+// note under "Benchmarking notes" in docs/backend/QNN.md.
 // a failed case degrades the session, so later cases in the same process are not
 // independent results; case_idx >= 0 runs one case alone for order/isolation permutations
 static int scenario_bigstatic(int case_idx) {
@@ -834,7 +838,14 @@ int main(int argc, char ** argv) {
         remove(dl_path);
     }
     if (mode == "modelscale" || mode == "rebake") {
-        remove(g_stats_path);
+        if (rc == 0) {
+            remove(g_stats_path);
+        } else {
+            // a FAILING run is exactly when these matter: io_shm_fallback is the first
+            // thing to read if the intermittent -shm failure recurs. removing the file
+            // here would destroy the evidence the run was instrumented to capture
+            printf("counters kept at %s for diagnosis\n", g_stats_path);
+        }
     }
 
     printf("%s: %d checks, %d failures\n", mode.c_str(), g_checks, g_failures);
