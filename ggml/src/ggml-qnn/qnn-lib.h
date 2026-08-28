@@ -97,6 +97,11 @@ ggml_qnn_session * ggml_qnn_session_init(void);
 
 void ggml_qnn_session_free(ggml_qnn_session * sess);
 
+// flush the GGML_QNN_STATS counters. Called from session free, and separately from the
+// degraded-session path, which deliberately never frees - without that second call a run
+// that degraded wrote no counters at all, exactly when they are most worth having
+void ggml_qnn_stats_write(void);
+
 // execute one ggml node (MUL_MAT, ADD, MUL) on the NPU
 enum ggml_status ggml_qnn_compute_node(ggml_qnn_session * sess, struct ggml_tensor * node);
 

@@ -45,6 +45,11 @@ static void ggml_backend_qnn_session_release(void) {
     GGML_ASSERT(ggml_qnn_session_refs > 0);
     if (--ggml_qnn_session_refs == 0) {
         if (ggml_qnn_session_ptr->degraded) {
+            // a degraded session is kept, not freed, so the flush inside session free
+            // never runs. Write the counters here too: a degraded run is exactly when
+            // someone reads them, and without this they got an absent file and -1 for
+            // every value, layered on top of whatever actually failed
+            ggml_qnn_stats_write();
             GGML_LOG_WARN("ggml-qnn: keeping degraded session, NPU disabled for this process\n");
             return;
         }

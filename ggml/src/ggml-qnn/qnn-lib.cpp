@@ -55,7 +55,7 @@ static std::atomic<uint64_t> ggml_qnn_stat_pad_n_last{0};
 
 // written on session teardown; counters are process-global and monotonic, so with a
 // refcounted session the last write is the cumulative total for the run
-static void ggml_qnn_stats_write(void) {
+void ggml_qnn_stats_write(void) {
     const char * path = getenv("GGML_QNN_STATS");
     if (!path || !*path) {
         return;
