@@ -73,13 +73,20 @@ context as well as in being separate runs.
 So quotability is per METRIC, not per run. Prefill at ~8% is defensible from one controlled
 run. Decode is not: quote a range or re-measure across three or more runs.
 
-**Between-run evidence for the GPU and the NPU is thin, and its conditions are unrecorded.**
-Only one settled-pack sample exists for each and this table quotes both from it. There is one
-cross-run comparison available - the superseded table described below - and it points two ways:
-the GPU came back within 0.3% (227.4 then 228.1) while the NPU moved 15.2%, and that NPU
-movement tracks the CPU clock rather than anything about the HTP. But the earlier run's pack
-state was never recorded, so it bounds reproducibility rather than measuring it. No two
-verified-settled sweeps exist, which is not the same as the numbers being fine.
+**The GPU number reproduces; the NPU number is still open.** Three sweeps have now measured
+GPU pp512 - the superseded table at 227.4, this one at 228.1, and a third at 223.3 - agreeing
+within 2.1%, and the GPU is also the tightest leg within a run (+-0.49 on 226.9, 0.2%). The
+third sweep picked up foreign CPU load partway through and is not clean, which makes the GPU
+agreement more informative rather than less: it held across a run whose CPU-bound legs were
+visibly disturbed, consistent with the GPU not leaning on the CPU threads.
+
+That same third sweep is why the NPU stays unresolved. Its pp512 came back 39% below this
+table, but two of the six legs ran at 62-64% total CPU where a `-t 6` workload predicts ~50%,
+and the NPU path runs six CPU threads - so the drop is what contamination predicts and cannot
+be separated from genuine between-run variation. The superseded table's 101.5 is no help
+either, since that run's pack state was never recorded. Treat NPU prefill as a single-sweep
+number until two clean sweeps agree; nobody has produced them, which is not the same as the
+number being fine.
 
 These supersede an earlier table that had the CPU at 116.4 / 16.0 and the NPU at 101.5 / 15.8,
 and that claimed the GPU took decode by 25%. Two things changed. The GPU reproduced to +0.3%,
