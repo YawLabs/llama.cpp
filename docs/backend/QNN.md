@@ -31,33 +31,48 @@ quantized weights to fp16 on the NPU within a memory budget.
 
 ## Measured comparison
 
-Qwen3-4B-Q4_K_M (2.32 GiB) on a Snapdragon X Elite (X1E80100), Windows 11 ARM64, AC power,
-`llama-bench -t 6 -p 512 -n 128 -r 5`, one build per backend from the same commit. Taken
-before this fork rebased onto upstream, so the numbers predate the current base and the
-commit they were measured at is no longer on master. The NPU leg runs `-ub 64` with
-`GGML_QNN_NPAD=64`.
+Qwen3-4B-Q4_K_M (2.32 GiB) on a Snapdragon X Elite (X1E80100), Windows 11 ARM64,
+`llama-bench -t 6 -p 512 -n 128 -r 5`, one build per backend from `b840f5720`. Six
+counterbalanced legs (CPU, GPU, NPU, NPU, GPU, CPU), 120 s cooldowns, each backend's pair
+averaged. Measured on AC with a settled pack - 100% charge drawing 4.6 W - which matters
+more than it sounds; see the power note under "Benchmarking notes". The NPU leg runs
+`-ub 64` with `GGML_QNN_NPAD=64`.
 
 | Backend | pp512 t/s | tg128 t/s |
 |---|---:|---:|
-| Adreno X1-85 (OpenCL) | 227.4 | 20.0 |
-| CPU (KleidiAI) | 116.4 | 16.0 |
-| Hexagon NPU (QNN) | 101.5 | 15.8 |
+| Adreno X1-85 (OpenCL) | 228.1 | 20.0 |
+| CPU (KleidiAI) | 132.2 | not reported |
+| Hexagon NPU (QNN) | 116.9 | 19.8 |
 
-The GPU takes prefill by 1.95x over the CPU and 2.24x over the NPU, and takes decode by 25%.
-The NPU loses prefill to the CPU by 15%. NPU decode matches the CPU because the backend does
-not claim decode - that leg is the CPU path with the QNN backend registered.
+The GPU takes prefill by 1.73x over the CPU and 1.95x over the NPU. The NPU loses prefill to
+the CPU by 12%. NPU decode tracks the CPU because the backend does not claim decode - that
+leg is the CPU path with the QNN backend registered.
 
-NPU prefill is also the noisiest number here: 21% relative stddev between repetitions against
-0.4% for the GPU, while the two run means agree to 1.3%. Per-op scheduling and first-hit bake
-sit on the critical path, which is the case for AOT context binaries.
+**CPU decode is deliberately not reported.** Its two counterbalanced legs came back 24.76 and
+20.01 t/s - a 21% pair spread, against 0.2% for the GPU and 0.4% for the NPU on the same run -
+and a separate pair of probe runs at 13-20% charge gave 12.66 and 22.91. So it is not an
+artifact of one power state: the metric is unstable settled and unstable depleted. The
+instability is reproducible and specific to CPU decode; no single figure would be honest, and
+averaging the pair would hide that rather than express it.
 
-The decode numbers correct an earlier assumption in this document. If decode were simply
-bandwidth-bound on the shared LPDDR5x, every engine would land on the same number; the Adreno
-instead takes it by 25%. Streaming the 2.32 GiB of weights once per token works out to roughly
-46 GiB/s for the GPU against 37 GiB/s for the CPU, and neither engine is at any bandwidth
-ceiling we have measured on this part. Decode here is bandwidth-sensitive rather than
-demonstrably bandwidth-saturated, so the engine still matters. The NPU is not claimed for
-decode and so is not measured for it - that column says nothing about what the HTP would do.
+The other five pairs agree within 2% (GPU 0.6% / 0.2%, NPU 1.8% / 0.4%, CPU prefill 1.6%),
+which is the counterbalanced design reporting its own cleanliness. NPU prefill is the noisiest
+surviving number at 5.5-7.4% relative stddev between repetitions against 0.2-1.3% for the GPU.
+Per-op scheduling and first-hit bake sit on the critical path, which is the case for AOT
+context binaries.
+
+These supersede an earlier table that had the CPU at 116.4 / 16.0 and the NPU at 101.5 / 15.8,
+and that claimed the GPU took decode by 25%. Two things changed. The GPU reproduced to +0.3%,
+but both CPU-thread-bound backends came back higher on prefill - CPU by 13.5%, NPU by 15.2% -
+tracking a CPU clock that averaged 85.6% of base on this run against 74.9% on the earlier one; the earlier run's
+pack state was never recorded, so the cause cannot now be established - only that the clocks
+were lower. And the GPU's 25% decode lead rested on that CPU figure of 16.0: CPU decode does
+not reproduce there, and even the low leg of its unstable pair lands at 20.01, level with the
+GPU's 20.03. On this run the three engines converge on decode (GPU 20.03, NPU 19.75, CPU
+20.01-24.76) while prefill separates them 228 / 132 / 117 - the shape of bandwidth-bound
+decode against compute-bound prefill. The earlier "the engine still matters for decode"
+reading is withdrawn. The NPU is not claimed for decode and so is not measured for it - that
+column says nothing about what the HTP would do.
 
 ## Requirements
 
@@ -134,7 +149,10 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   generation and makes results noisy (44% vs 7% relative stddev, measured on AC power) -
   decode's per-token threadpool barriers pay for oversubscription, prefill shows no
   comparable collapse. Use about half the cores (`-t 6` on the 12-core X1E80100) for any
-  decode measurement.
+  decode measurement. That fixes the oversubscription collapse but does not make CPU decode
+  stable: at `-t 6` on a settled pack it still ran 13.8-16.7% relative stddev within a leg
+  and 21% between counterbalanced legs. Treat the 7% above as the best case, not the
+  expectation, and see "Measured comparison" for why no CPU tg128 figure is quoted.
 - The NPU is a single-client device: never run two NPU-using processes at once, the HTP
   can wedge and need a device reset.
 - Memory is unified (CPU, GPU and NPU share the same LPDDR5x pool and bandwidth); budget
@@ -143,9 +161,22 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   end of a four-leg sweep came back 26% low on AC and 43% low on battery. On the AC run the
   clock slid from 87% to 69% of base across the four legs; on battery, 43% to 33%.
   Counterbalance the order (CPU, GPU, NPU, NPU, GPU, CPU) and cool down 120 s between legs,
-  then average each backend's pair; that reproduces every backend within 0.1-3.5%.
+  then average each backend's pair. That reproduces prefill for every backend within 2% and
+  decode for the GPU and NPU within 0.4%. CPU decode does not converge even counterbalanced -
+  a 21% pair spread - so do not quote a single CPU tg128 figure from one sweep.
 - Battery is not just slower, it is differently shaped. A position-matched pass on DC
-  measured the GPU 1.6x down but the NPU 3.5x down (pp512 27.7 vs 95.8 t/s). Measure on AC.
+  measured the GPU 1.6x down but the NPU 3.5x down (pp512 27.7 vs 95.8 t/s).
+- AC alone is not enough: the pack must also be SETTLED. A deeply discharged pack on AC runs
+  CPU prefill at about half speed - 58.1 and 57.9 t/s measured at 13-20% charge against 132.2
+  settled. Whether the GPU escapes this is UNMEASURED - the low-charge probe ran CPU and NPU
+  legs only, so treat the requirement below as applying to every backend until someone runs a
+  GPU leg on a depleted pack. Recovery is largely done by 33-42%, but not complete: single
+  legs there returned 124.5 t/s at 33% and 112.6 at 41.6%, still 6% and 15% under the settled
+  132.2, and non-monotonic between the two. Require >40% charge and a charge draw under 5 W before
+  measuring, and record charge percent and draw per sample so a suspect run stays legible
+  afterwards; "plugged in" on its own will silently halve CPU-bound and NPU-bound prefill
+  while looking correct. Charge draw also collapses mid-leg under load (32 W to 1.1 W inside
+  a single CPU leg), so a reading taken before the leg does not describe the leg.
 - Throughput cannot tell you which engine ran. Verify GPU placement with PID-filtered
   `\GPU Engine(*)\Utilization Percentage` (about 95% under load against a ~2% idle
   baseline); `--device`, `--list-devices` and reported free memory have all failed to catch
