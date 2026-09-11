@@ -1,5 +1,7 @@
 # llama.cpp
 
+[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+
 > [!NOTE]
 > **This is the YawLabs fork of [llama.cpp](https://github.com/ggml-org/llama.cpp).** It adds an
 > experimental **QNN backend** for the Qualcomm Hexagon NPU on Windows on Snapdragon
