@@ -27,5 +27,8 @@ ggml_add_backend_library(${TARGET_NAME}
     qnn-mem.h
     ../../include/ggml-qnn.h)
 
-target_include_directories(${TARGET_NAME} PRIVATE ${QNN_SDK_INCLUDE_DIR})
+# SYSTEM: the QAIRT headers are not warning-clean (QnnTypes.h gives an enum a 0xFFFFFFFF
+# enumerator, which clang reports as -Wmicrosoft-enum-value), and without it a -Werror build
+# fails in every TU that includes them rather than on anything this backend wrote
+target_include_directories(${TARGET_NAME} SYSTEM PRIVATE ${QNN_SDK_INCLUDE_DIR})
 target_link_libraries(${TARGET_NAME} PRIVATE ${CMAKE_DL_LIBS})
