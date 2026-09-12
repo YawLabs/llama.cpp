@@ -32,9 +32,11 @@
 //                                 while claiming normal ones
 //   test-qnn-lifecycle elementwise  at DEFAULT env ADD/MUL must be refused (the HTP has a
 //                                 known broadcast bug), while mul_mat is still claimed
-//   test-qnn-lifecycle loadprobe  supports_op must give the same verdict for a weight
-//                                 probed unallocated (data == NULL, no WEIGHTS usage, as
-//                                 llama does at model load) as for the resident, tagged one
+//   test-qnn-lifecycle loadprobe  supports_op must give the same verdict for a weight probed
+//                                 unallocated (data == NULL) as for the resident weight it
+//                                 becomes: the loader's dummy-buffer probe against the
+//                                 WEIGHTS-tagged weight, and a buffer-less graph tensor
+//                                 against the same weight resident in an untagged buffer
 //   test-qnn-lifecycle rebake     one weight probed at two N in the same pad bucket bakes
 //                                 once: the budget is sized so a per-N re-bake regression
 //                                 (the original NPU-memory-exhaustion failure) fails the test
@@ -103,9 +105,10 @@ struct mul_mat_case {
 };
 
 // dst(N,M) = src1(N,K) x src0(M,K)^T computed on one backend, weights in a buffer tagged
-// GGML_BACKEND_BUFFER_USAGE_WEIGHTS so the QNN static-bake path triggers
+// GGML_BACKEND_BUFFER_USAGE_WEIGHTS so the QNN static-bake path triggers. tag_weights = false
+// leaves that buffer untagged, which is where a graph tensor lands and where no bake can happen
 static bool run_mul_mat(ggml_backend_t backend, const mul_mat_case & c, std::vector<float> & out,
-                        bool * claimed = nullptr) {
+                        bool * claimed = nullptr, bool tag_weights = true) {
     ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_init_params gp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
 
@@ -119,7 +122,9 @@ static bool run_mul_mat(ggml_backend_t backend, const mul_mat_case & c, std::vec
     ggml_build_forward_expand(gf, dst);
 
     ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
-    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (tag_weights) {
+        ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
     // weight data: f32 source, quantized in one chunk when the type needs it
@@ -174,10 +179,10 @@ static ggml_backend_t cpu_backend_init(void) {
 }
 
 // probe supports_op for a static-weight mul_mat without computing, weight data resident
-static bool probe_claim(ggml_backend_t backend, const mul_mat_case & c) {
+static bool probe_claim(ggml_backend_t backend, const mul_mat_case & c, bool tag_weights = true) {
     std::vector<float> dummy;
     bool claimed = false;
-    run_mul_mat(backend, c, dummy, &claimed);
+    run_mul_mat(backend, c, dummy, &claimed, tag_weights);
     return claimed;
 }
 
@@ -605,10 +610,18 @@ static int scenario_elementwise(void) {
 }
 
 // llama's model loader probes supports_op for every weight BEFORE the data is resident: the
-// weight sits in a no_alloc context, so data is NULL and its buffer is not tagged WEIGHTS.
-// That verdict must match the one taken at schedule time on the same resident, tagged weight
-// - otherwise the backend either claims a shape it will refuse later, or finalizes and
-// permanently caches a dynamic-variant graph for a shape real inference never executes
+// weight sits in a no_alloc context, so data is NULL, and the loader hangs a zero-size dummy
+// buffer of the candidate buffer type on it so the backend can see where the weight will land
+// (llama-model-loader.cpp, weight_buft_supported). That verdict must match the one taken at
+// schedule time on the same resident, WEIGHTS-tagged weight - otherwise the backend either
+// claims a shape it will refuse later, or finalizes and permanently caches a dynamic-variant
+// graph for a shape real inference never executes.
+//
+// A graph tensor is the other unallocated shape and asks a different question: it has no buffer
+// at all, and whoever allocates it (test-backend-ops, ggml-alloc behind a scheduler split)
+// leaves it untagged, so a quantized weight can never be baked from it. Its verdict must match
+// the resident UNTAGGED one, the path the node really takes at compute; claiming it there fails
+// the op outright where a refusal would have left it on the CPU
 static int scenario_loadprobe(void) {
     printf("scenario: loadprobe\n");
     ggml_backend_t qnn = qnn_backend_init();
@@ -622,23 +635,39 @@ static int scenario_loadprobe(void) {
     const ggml_type wtypes[] = { GGML_TYPE_F16, GGML_TYPE_Q4_0 };
 
     for (ggml_type wt : wtypes) {
-        // load-time shape: weight never allocated, so data == NULL and no WEIGHTS usage tag
+        // unallocated shapes: data == NULL for both, the buffer is the whole difference
         ggml_init_params gp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(gp);
         ggml_tensor * w = ggml_new_tensor_2d(ctx, wt, K, M);
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
         ggml_tensor * d = ggml_mul_mat(ctx, w, x);
+
+        // graph tensor: no buffer at all, so nothing will tag it WEIGHTS
+        const bool claim_graph = ggml_backend_dev_supports_op(dev, d);
+
+        // load-time weight: the loader's zero-size dummy buffer of the destination type
+        ggml_backend_buffer_t dummy = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), 0);
+        w->buffer = dummy;
         const bool claim_load = ggml_backend_dev_supports_op(dev, d);
+        w->buffer = nullptr;
+        ggml_backend_buffer_free(dummy);
         ggml_free(ctx);
 
         // schedule-time shape: same dims, resident data, buffer tagged WEIGHTS
         const mul_mat_case c = { wt, K, M, N };
         const bool claim_sched = probe_claim(qnn, c);
 
+        // the same resident weight in an untagged buffer: no bake, so no quantized path
+        const bool claim_untagged = probe_claim(qnn, c, /*tag_weights=*/false);
+
         char msg[176];
         snprintf(msg, sizeof(msg), "%s supports_op agrees load-time vs schedule-time (load=%d sched=%d)",
                  ggml_type_name(wt), (int) claim_load, (int) claim_sched);
         check(claim_load == claim_sched, msg);
+
+        snprintf(msg, sizeof(msg), "%s supports_op agrees graph-tensor vs untagged resident (graph=%d untagged=%d)",
+                 ggml_type_name(wt), (int) claim_graph, (int) claim_untagged);
+        check(claim_graph == claim_untagged, msg);
     }
 
     ggml_backend_free(qnn);

@@ -210,6 +210,12 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
+    // a quantized weight is claimable only when it can be baked statically (dequant once,
+    // correct) or the experimental per-execute dequant path is enabled. both are read here
+    // because the unallocated-probe answer at the bottom depends on them too
+    static const bool quant_ok  = getenv("GGML_QNN_QUANTIZED") != nullptr;
+    static const bool static_on = getenv("GGML_QNN_NO_STATIC_WEIGHTS") == nullptr;
+
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -222,10 +228,6 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
         {
             // 2D weights (F32, F16, or any quantized type with a dequantizer) times F32
             // activations, the HTP runs the math in FP16
-            // a quantized weight is claimable only when it can be baked statically (dequant once,
-            // correct) or the experimental per-execute dequant path is enabled
-            static const bool quant_ok  = getenv("GGML_QNN_QUANTIZED") != nullptr;
-            static const bool static_on = getenv("GGML_QNN_NO_STATIC_WEIGHTS") == nullptr;
             const bool src0_ok = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
                                  ((quant_ok || static_on) && ggml_is_quantized(src0->type) &&
                                   ggml_get_type_traits(src0->type)->to_float != NULL);
@@ -297,6 +299,20 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
     // quantized weight was refused at load and claimed at run - and cached a finalized
     // dynamic-variant graph for a shape inference never executes
     if (op->op == GGML_OP_MUL_MAT && src0->data == nullptr) {
+        // a quantized weight is the exception, because its only default-env path is the static
+        // bake and that needs the bytes in a host buffer the caller tags WEIGHTS. The two kinds
+        // of unallocated probe differ in exactly that: a weight probed for PLACEMENT carries a
+        // zero-size dummy buffer of its destination type (llama-model-loader.cpp,
+        // weight_buft_supported), so the policy answer above holds; a probe with no buffer at
+        // all is a graph tensor - test-backend-ops, or the scheduler's split passes, which run
+        // before the graph is allocated - and whoever allocates it leaves it untagged, so
+        // ggml_qnn_mul_mat_policy refuses it and ggml_qnn_compute_node fails the node. Claiming
+        // it here turned a CPU fallback into a failed op: MUL_MAT went 2/6 in test-backend-ops,
+        // every quantized case claimed at the probe and failing at compute
+        if (ggml_is_quantized(src0->type) && !quant_ok &&
+            (src0->buffer == nullptr || !ggml_backend_buffer_is_host(src0->buffer))) {
+            return false;
+        }
         return true;
     }
 

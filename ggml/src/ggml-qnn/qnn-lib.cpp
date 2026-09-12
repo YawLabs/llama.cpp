@@ -596,7 +596,6 @@ static bool ggml_qnn_mul_mat_policy(ggml_qnn_session * sess, ggml_qnn_graph & g,
 
 static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, const ggml_tensor * node) {
     const ggml_tensor * src0 = node->src[0];
-    const ggml_tensor * src1 = node->src[1];
 
     const uint32_t K = (uint32_t) src0->ne[0];
     const uint32_t M = (uint32_t) src0->ne[1];

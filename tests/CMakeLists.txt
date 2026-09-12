@@ -187,9 +187,11 @@ if (GGML_QNN)
 
     # SKIP_RETURN_CODE: the test exits 77 when no HTP is present. Without it every entry
     # returned 0 and the whole suite reported green on hardware that never ran QNN code.
-    # test-qnn-watchdog is judged by its output marker instead of its exit code (the
-    # deliberately leaked degraded session can crash during exit), so on a machine with no
-    # HTP it fails loudly rather than skipping - the safe direction.
+    # test-qnn-watchdog carries both properties: PASS_REGULAR_EXPRESSION judges the runs that
+    # reached the scenario, because the deliberately leaked degraded session can crash during
+    # exit and lose the exit code, while SKIP_RETURN_CODE still decides first - so on a machine
+    # with no HTP the watchdog entry reports NOT RUN like every other one, measured on a run
+    # where QnnHtp.dll was not loadable. A missing marker only fails a run that got that far.
     set_tests_properties(
         test-qnn-basic test-qnn-budget test-qnn-denylist test-qnn-watchdog
         test-qnn-modelscale test-qnn-modelscale-npad0 test-qnn-noopt

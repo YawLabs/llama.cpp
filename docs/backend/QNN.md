@@ -119,6 +119,11 @@ cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
 cmake --build build
 ```
 
+On Windows, enable long paths for the checkout before building: `git clone -c
+core.longpaths=true ...`, or `git config core.longpaths true` in an existing clone. Some
+`tools/ui` and `tools/server/webui` paths exceed MAX_PATH, and without it git reports
+`Filename too long` and leaves those files out of the working tree.
+
 This fork carries a build fix the CPU backend needs on Windows ARM64. KleidiAI's assembly
 selects armasm syntax on `_MSC_VER` and GNU syntax otherwise, but clang targeting
 `*-windows-msvc` defines `_MSC_VER` while assembling GNU syntax into COFF, so it matches
@@ -138,7 +143,12 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   HTP rejects or that wedge it are denylisted and permanently routed to the CPU.
   Weights probed before their data is resident (llama's model-load pass) are answered
   from the type and shape policy alone - a trial build needs the real bytes - and the
-  HTP trial happens on the first scheduled node instead.
+  HTP trial happens on the first scheduled node instead. A quantized weight is the
+  exception: its only path is the static bake, which needs the bytes in a buffer the
+  caller tags WEIGHTS, so it is claimed unallocated only when the probe carries the
+  destination buffer (llama hangs a dummy one on the weight for exactly this). A
+  quantized tensor probed with no buffer at all - a graph tensor, as in
+  `test-backend-ops` - is refused, because nothing will tag it and the bake cannot happen.
 - Model weights are baked into their graphs once (dequantized to fp16 when quantized) in
   HTP-native layout, within a memory budget (default 2048 MB). Weights past the budget
   stay on the CPU. The first time a shape is seen it pays graph build + finalize + bake
