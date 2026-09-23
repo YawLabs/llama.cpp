@@ -634,7 +634,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
         # clang targeting *-windows-msvc defines _MSC_VER but assembles GNU syntax into COFF,
         # so KleidiAI's .S files match neither of their two branches. Add the missing one
-        # before its build system sees them. Idempotent, and re-run so a re-extract is covered
+        # before its build system sees them. Re-runnable, keyed on the "elif defined(_WIN32)" sentinel,
+        # so a re-configure or a re-extract is covered; inert under armasm64 (cl.exe, clang-cl), active for clang's GNU driver and llvm-mingw
         if (WIN32)
             execute_process(
                 COMMAND ${CMAKE_COMMAND} -DKLEIDIAI_SRC=${KLEIDIAI_SRC}
