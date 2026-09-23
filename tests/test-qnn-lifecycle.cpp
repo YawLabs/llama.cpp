@@ -708,6 +708,38 @@ static int scenario_budget(void) {
     return g_failures ? 1 : 0;
 }
 
+// the placement probe carries llama's FICTITIOUS weight-probe batch, not a batch any graph
+// runs in, so a denylist entry written by a real run sits in a different bucket. scenario_denylist
+// cannot catch a mismatch: it pins GGML_QNN_NPAD=512 and probes at N=60, so seed and probe land
+// in the same 512 bucket. At the documented K-quant route (GGML_QNN_NPAD=32 with -ub 32) every
+// persisted entry is in the 32 bucket while the probe still arrives carrying 512, and the file
+// entry matched nothing at model load. main() seeded the key a -ub 32 run would have written
+static int scenario_denylist_probe(void) {
+    printf("scenario: denylist-probe\n");
+    ggml_backend_t qnn = qnn_backend_init_checked();
+    ggml_backend_dev_t dev = ggml_backend_get_device(qnn);
+
+    // N=512 is what llama-model-loader hands weight_buft_supported (llama-model-loader.cpp,
+    // weight_buft_supported builds src1 with ne[1]=512 regardless of the real ubatch)
+    const mul_mat_case seeded = { GGML_TYPE_F16, 256, 128, 512 };
+    check(!probe_unallocated(dev, seeded, /*with_dummy=*/true),
+          "placement probe at the loader's fictitious N=512 matches the entry persisted in the 32 bucket");
+
+    // the same shape WITHOUT the loader's dummy buffer is a plain graph tensor, so its N is
+    // real: it would build in the 512 bucket, which was never denylisted. it must stay claimed,
+    // which is also what keeps the check above from passing on a backend that refuses everything
+    check(probe_unallocated(dev, seeded, /*with_dummy=*/false),
+          "buffer-less graph tensor at a real N=512 is claimed: its own bucket is not denylisted");
+
+    // control: a weight width that was never seeded is claimed at the same probe
+    const mul_mat_case clean = { GGML_TYPE_F16, 256, 64, 512 };
+    check(probe_unallocated(dev, clean, /*with_dummy=*/true),
+          "an unseeded weight is still claimed at the same placement probe");
+
+    ggml_backend_free(qnn);
+    return g_failures ? 1 : 0;
+}
+
 static int scenario_denylist(bool noopt) {
     printf("scenario: denylist%s\n", noopt ? " (GGML_QNN_NO_OPT=1)" : "");
     // main() seeded the file with:
@@ -877,7 +909,8 @@ static int scenario_modelscale(void) {
 // on battery while the 256-class worked. this mode is the discriminator, but "run it on AC"
 // is NOT a sufficient precondition: a deeply discharged pack on AC runs CPU-bound work at
 // roughly half speed, so an AC hang can be power and be misread as implicating the runtime.
-// run it on AC with a SETTLED pack - above 40% charge, drawing under 5 W - and only then
+// run it on AC with a SETTLED pack - drawing under 5 W, with the charge percent recorded as a
+// covariate rather than used as a gate - and only then
 // does a clean pass isolate power limiting and a hang implicate the runtime. see the power
 // note under "Benchmarking notes" in docs/backend/QNN.md.
 // a failed case degrades the session, so later cases in the same process are not
@@ -1354,11 +1387,6 @@ static int scenario_loadprobe(void) {
     return g_failures ? 1 : 0;
 }
 
-// one weight probed at two batch sizes inside the same pad bucket must bake ONCE: the graph
-// key is (padded shape, weight address), so both probes share a graph. the budget (2 MB) fits
-// exactly one bake of the 1.125 MB weight - a per-N re-bake regression (the failure that
-// originally exhausted NPU memory) makes the second probe over-budget and fails the test.
-// the weight stays alive across both probes so its address cannot be reused
 // device health, not backend logic: one model-scale matmul (84 M multiply-accumulates) must
 // execute in well under a second. the functional entries stay green on a device far too slow
 // to be useful, so this one times it. its verdict only means something with nothing else
@@ -1394,6 +1422,11 @@ static int scenario_health(void) {
     return g_failures ? 1 : 0;
 }
 
+// one weight probed at two batch sizes inside the same pad bucket must bake ONCE: the graph
+// key is (padded shape, weight address), so both probes share a graph. the budget (2 MB) fits
+// exactly one bake of the 1.125 MB weight - a per-N re-bake regression (the failure that
+// originally exhausted NPU memory) makes the second probe over-budget and fails the test.
+// the weight stays alive across both probes so its address cannot be reused
 static int scenario_rebake(void) {
     printf("scenario: rebake\n");
     ggml_backend_t qnn = qnn_backend_init_checked();
@@ -2150,7 +2183,8 @@ int main(int argc, char ** argv) {
 
     // the backend latches env at first use, so all setup happens before the registry is touched
     const char * dl_path = "test-qnn-lifecycle-denylist.tmp";
-    const bool uses_dl = mode == "budget" || mode == "denylist" || mode == "watchdog" || mode == "fault" || mode == "clamp" ||
+    const bool uses_dl = mode == "budget" || mode == "denylist" || mode == "denylist-probe" || mode == "watchdog" ||
+                         mode == "fault" || mode == "clamp" ||
                          mode == "slow-validate" || mode == "validate-timeout" || mode == "compute-timeout" ||
                          mode == "finalize-error" || mode == "denylist-append";
     // these leave a degraded session behind on purpose (the timeout ones also an abandoned
@@ -2225,6 +2259,20 @@ int main(int argc, char ** argv) {
         set_env("GGML_QNN_STATIC_BUDGET_MB", "1");
         set_env("GGML_QNN_DENYLIST", dl_path);
         set_env("GGML_QNN_NPAD", "64"); // keeps the over-budget probe under the IO cap, see the scenario
+    } else if (mode == "denylist-probe") {
+        set_env("GGML_QNN_MIN_DIM", "1");
+        set_env("GGML_QNN_DENYLIST", dl_path);
+        // the bucket a -ub 32 run builds in, and the one ggml_qnn_pad_n(1) resolves to
+        set_env("GGML_QNN_NPAD", "32");
+        FILE * f = fopen(dl_path, "w");
+        if (!f) {
+            fprintf(stderr, "cannot create %s\n", dl_path);
+            return 1;
+        }
+        // byte-for-byte what a real run at this bucket persists - N is 32, NOT the 512 the
+        // placement probe arrives with
+        fprintf(f, "MUL_MAT_f16_f32_256x128x1x1_256x32x1x1_s\n");
+        fclose(f);
     } else if (mode == "denylist") {
         // argv[2] "noopt": file entries are advisory under GGML_QNN_NO_OPT
         if (argc > 2 && strcmp(argv[2], "noopt") != 0) {
@@ -2388,7 +2436,7 @@ int main(int argc, char ** argv) {
     } else {
         fprintf(stderr, "unknown mode %s (basic|budget|denylist [noopt]|watchdog|fault|clamp [unlimited]|bigstatic|modelscale|health|"
                         "disable|mindim|rebake|elementwise|elementwise-on|loadprobe|slow-validate|slow-compute|validate-timeout [cold]|"
-                        "compute-timeout|finalize-error|denylist-append|reuse|dyncache|quantized|envparse)\n", mode.c_str());
+                        "compute-timeout|finalize-error|denylist-append|denylist-probe|reuse|dyncache|quantized|envparse)\n", mode.c_str());
         return 1;
     }
 
@@ -2431,6 +2479,8 @@ int main(int argc, char ** argv) {
         rc = scenario_basic();
     } else if (mode == "budget") {
         rc = scenario_budget();
+    } else if (mode == "denylist-probe") {
+        rc = scenario_denylist_probe();
     } else if (mode == "denylist") {
         rc = scenario_denylist(argc > 2);
     } else if (mode == "watchdog") {

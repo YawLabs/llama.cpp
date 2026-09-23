@@ -160,6 +160,8 @@ if (GGML_QNN)
     llama_test(test-qnn-lifecycle NAME test-qnn-basic    ARGS basic)
     llama_test(test-qnn-lifecycle NAME test-qnn-budget   ARGS budget)
     llama_test(test-qnn-lifecycle NAME test-qnn-denylist ARGS denylist)
+    # the placement probe's fictitious N against an entry persisted in another bucket
+    llama_test(test-qnn-lifecycle NAME test-qnn-denylist-probe ARGS denylist-probe)
     llama_test(test-qnn-lifecycle NAME test-qnn-watchdog ARGS watchdog)
     llama_test(test-qnn-lifecycle NAME test-qnn-fault    ARGS fault)
     llama_test(test-qnn-lifecycle NAME test-qnn-clamp    ARGS clamp)
