@@ -27,7 +27,9 @@ On that machine:
   they were meant to show are real and still in the code: a DCVS TURBO power config, and
   baking a weight once into the HTP-native layout instead of re-tiling it on every
   execute. What either is worth on an idle machine is an open question
-- **45/45** `test-backend-ops` MUL_MAT correctness (F32/F16) with a clean process exit -
+- **47/47** `test-backend-ops` MUL_MAT correctness (F32/F16) against the CPU, run by ctest as
+  `test-backend-ops-qnn`. One run in five has been seen to fail a single case (46/47); that
+  flake is not diagnosed. With a clean process exit -
   observed clean on the recorded runs (2026-08-28 ctest log, 2026-09-16), including with a
   live or degraded HTP session, though a teardown crash inside `QnnHtp.dll` stays listed as
   a known limitation in the docs - plus a dedicated lifecycle suite

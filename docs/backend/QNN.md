@@ -16,7 +16,7 @@ time and the QAIRT runtime DLLs (`QnnHtp.dll` and its dependencies) at run time,
 
 | What | State |
 |---|---|
-| `test-backend-ops` MUL_MAT (F32/F16 weights) | 45/45 pass |
+| `test-backend-ops` MUL_MAT (F32/F16 weights) | 47/47 pass via `ctest -R test-backend-ops-qnn`; one 46/47 flake seen in five runs, undiagnosed |
 | Single-matmul kernel throughput (burst clocks + static weights) | no figure claimed: the August 2026 numbers were taken without recording box load and have not been re-taken |
 | Real-model inference | completes, no hangs; unsupported shapes fall back to the CPU automatically |
 | End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | no valid NPU figure yet: the one 4B sweep's NPU leg never executed a matmul on the HTP (see the retraction under Measured comparison); unmeasured on 9-14B |
@@ -370,7 +370,12 @@ On a box known to have an HTP, configure with `-DLLAMA_QNN_TEST_REQUIRE_HTP=ON` 
 OFF), which sets `GGML_QNN_TEST_REQUIRE_HTP=1` on every `test-qnn-*` entry, or export that
 variable for a single run: the skip becomes a failure (exit 1), so a device or context that failed to create cannot turn the whole suite into skips while ctest still exits 0.
 `test-qnn-modelscale-shm` also exits 77 when the fastrpc library is absent (`shm_selftest 0` in its stats file); a library that is present with a failed self-test (`shm_selftest 1`) fails the entry.
-`test-backend-ops -b QNN -o MUL_MAT` is the 45/45 figure in the Status table.
+`test-backend-ops -b QNN -o MUL_MAT` is the figure in the Status table, but ONLY with
+`GGML_QNN_NPAD=32` and `GGML_QNN_MIN_DIM=1` set. At the default pad bucket of 512 every one of
+the ~1680 test shapes is lifted over `GGML_QNN_IO_MAX_KB` and declined by `supports_op`, and the
+binary then prints `Backend QNN: OK` having compared nothing. The ctest entry
+`test-backend-ops-qnn` pins those settings and fails if the executed count is zero, so a green
+run means something; a bare manual invocation at the defaults does not.
 
 `test-kleidiai-coff-patch` needs no HTP and no compiler: it runs
 `kleidiai-patch-coff-asm.cmake` (see Build) with `cmake -P` over generated `.S` fixtures
