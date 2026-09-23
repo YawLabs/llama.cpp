@@ -163,7 +163,9 @@ bool ggml_qnn_supports_node(ggml_qnn_session * sess, const struct ggml_tensor * 
 // GGML_QNN_DENYLIST file, loaded on first call). shape only, no session needed: for a
 // MUL_MAT both the static and the dynamic variant are consulted, because an unallocated
 // probe cannot yet tell which one the node will become
-bool ggml_qnn_shape_denylisted(const struct ggml_tensor * node);
+// placement_probe: true when the node carries llama's fictitious weight-probe batch rather
+// than a batch a graph runs in, which changes which denylist keys can match
+bool ggml_qnn_shape_denylisted(const struct ggml_tensor * node, bool placement_probe);
 
 // the MUL_MAT weight-type policy, shared by supports_op and the graph policy so the two never
 // disagree: F32 and F16 always; a quantized type with a dequantizer when it can be baked

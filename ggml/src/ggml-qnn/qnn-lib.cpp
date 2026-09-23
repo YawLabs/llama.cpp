@@ -105,7 +105,11 @@ static void ggml_qnn_degrade(ggml_qnn_session * sess, const char * why, bool slo
     sess->degraded.store(true);
     sess->slow_only = slow_only; // any later hard degrade ends it, see ggml_qnn_session
     if (!reported.exchange(true)) {
-        fprintf(stderr, "ggml-qnn: NPU degraded (%s), claiming no ops for the rest of this process: everything runs on the CPU from here\n", why);
+        // a slow_only degrade keeps the graphs it already built running on the NPU, so the
+        // blanket "everything runs on the CPU" tail would be false for exactly that case
+        fprintf(stderr, "ggml-qnn: NPU degraded (%s), claiming no ops for the rest of this process%s\n", why,
+                slow_only ? ": graphs already built keep running on the NPU, every new shape goes to the CPU"
+                          : ": everything runs on the CPU from here");
         fflush(stderr);
     } else {
         GGML_LOG_WARN("ggml-qnn: NPU degraded (%s), claiming no ops for the rest of this process\n", why);
@@ -752,12 +756,18 @@ static std::vector<uint32_t> ggml_qnn_dims(const ggml_tensor * t) {
 // shape-only key: stable across runs, used for the failed-shape denylist. is_static picks the
 // variant tag, which matters: static-baked and dynamic-weight graphs are different HTP
 // programs with different finalize outcomes, a denylist entry must only ban the one that failed
-static std::string ggml_qnn_shape_key(const ggml_tensor * node, bool is_static) {
+// n_bucket overrides the batch bucket the key is built in, 0 means the node's own. the
+// placement probe needs the override: llama hands weight_buft_supported a fictitious N, so a
+// key built from it names a graph nothing ever runs, while the entries already in the denylist
+// file were written in whatever bucket the real ubatch produced
+static std::string ggml_qnn_shape_key(const ggml_tensor * node, bool is_static, uint32_t n_bucket = 0) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
 
     // matmul graphs use the padded batch dim, so every N in a bucket shares one graph
-    const int64_t ne11 = node->op == GGML_OP_MUL_MAT ? (int64_t) ggml_qnn_pad_n((uint32_t) src1->ne[1]) : src1->ne[1];
+    const int64_t ne11 = node->op == GGML_OP_MUL_MAT
+        ? (int64_t) (n_bucket ? n_bucket : ggml_qnn_pad_n((uint32_t) src1->ne[1]))
+        : src1->ne[1];
 
     char buf[256];
     snprintf(buf, sizeof(buf), "%s_%s_%s_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "%s",
@@ -872,6 +882,22 @@ static bool ggml_qnn_mul_mat_policy(ggml_qnn_session * sess, ggml_qnn_graph & g,
         // tracked in unlimited mode too, so a clamp has a meaningful committed value
         const size_t need = ggml_qnn_static_bytes(src0);
         if (sess->static_budget && ggml_qnn_static_committed.load() + need > sess->static_budget) {
+            // the only env-fixable refusal in this file that used to emit nothing at any level,
+            // and the default was halved to 1024 MB, so it is twice as easy to reach. same shape
+            // of notice the IO cap gets: one DEBUG per shape, one stderr line per process,
+            // because llama-bench without -v installs a null log callback and would otherwise
+            // report a CPU run under the QNN backend name with no hint
+            const size_t committed = ggml_qnn_static_committed.load();
+            GGML_LOG_DEBUG("ggml-qnn: %s: static weight needs %.1f MiB, %.1f of %.1f MiB committed, staying on the CPU\n",
+                           ggml_qnn_shape_key(node).c_str(), need / (1024.0 * 1024.0),
+                           committed / (1024.0 * 1024.0), sess->static_budget / (1024.0 * 1024.0));
+            static std::atomic<bool> budget_reported{false};
+            if (!budget_reported.exchange(true)) {
+                fprintf(stderr, "ggml-qnn: the %.0f MiB static-weight budget is full (%.1f MiB committed), so further weights stay on "
+                                "the CPU; GGML_QNN_STATIC_BUDGET_MB raises it, 0 lifts it. later refusals are logged at DEBUG\n",
+                        sess->static_budget / (1024.0 * 1024.0), committed / (1024.0 * 1024.0));
+                fflush(stderr);
+            }
             g.policy_reject = true;
             return false;
         }
@@ -1108,11 +1134,28 @@ static void ggml_qnn_denylist_add(const std::string & shape_key, bool persist) {
     }
 }
 
-bool ggml_qnn_shape_denylisted(const ggml_tensor * node) {
+// placement_probe: the node carries llama's fictitious weight-probe batch (512), not a batch
+// any graph runs in, so a key built from it matches nothing that was ever persisted - the
+// entries on disk were written in the bucket the real ubatch produced. At GGML_QNN_NPAD=32
+// with -ub 32, the documented route for K-quants, that is the smallest bucket, so the probe
+// asks about it too. Both buckets are checked rather than just the small one: dropping the
+// node's own would move the blind spot to a -ub 512 run, whose graphs are in the 512 bucket
+bool ggml_qnn_shape_denylisted(const ggml_tensor * node, bool placement_probe) {
     if (ggml_qnn_denylisted(ggml_qnn_shape_key(node, false))) {
         return true;
     }
-    return node->op == GGML_OP_MUL_MAT && ggml_qnn_denylisted(ggml_qnn_shape_key(node, true));
+    if (node->op == GGML_OP_MUL_MAT && ggml_qnn_denylisted(ggml_qnn_shape_key(node, true))) {
+        return true;
+    }
+    if (!placement_probe || node->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const uint32_t small = ggml_qnn_pad_n(1);
+    if (small == ggml_qnn_pad_n((uint32_t) node->src[1]->ne[1])) {
+        return false; // the probe already landed in that bucket, asked above
+    }
+    return ggml_qnn_denylisted(ggml_qnn_shape_key(node, false, small)) ||
+           ggml_qnn_denylisted(ggml_qnn_shape_key(node, true, small));
 }
 
 // serialize the finalized context to a binary, reload it into a fresh context, and time both,

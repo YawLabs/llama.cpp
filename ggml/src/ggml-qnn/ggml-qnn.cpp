@@ -354,7 +354,10 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
         }
         // a wedged NPU and a shape already known to fail are refused here as well, so a
         // weight is not placed on the NPU at load only to fall back at schedule time
-        if (ggml_backend_qnn_session_degraded() || ggml_qnn_shape_denylisted(op)) {
+        // src0->data is NULL here, so a buffer means this is llama's placement probe and the
+        // node's N is fictitious - see ggml_qnn_shape_denylisted
+        if (ggml_backend_qnn_session_degraded() ||
+            ggml_qnn_shape_denylisted(op, /*placement_probe=*/buf0 != nullptr)) {
             return false;
         }
         return true;
