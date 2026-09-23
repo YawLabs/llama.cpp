@@ -169,6 +169,16 @@ if (GGML_QNN)
     # NPU that works but runs slowly, which every functional entry tolerates. only meaningful
     # with nothing else running on the machine
     llama_test(test-qnn-lifecycle NAME test-qnn-health   ARGS health)
+    # positive control for the entry above: health must FAIL when the NPU really is slow, or a
+    # green test-qnn-health proves nothing. GGML_QNN_NO_F16_IO forces the old mixed-dtype matmul,
+    # which ran 400x slow (13.7 s where the fixed path takes 0 ms), and health passes the env
+    # through because it is a "tuned" mode. NOT WILL_FAIL: that would pass on a crash or a missing
+    # DLL too. The pass condition is health failing for the RIGHT reason - its own slow-execute
+    # check printing FAIL - so this entry cannot go green vacuously
+    llama_test(test-qnn-lifecycle NAME test-qnn-health-control ARGS health)
+    set_tests_properties(test-qnn-health-control PROPERTIES
+        ENVIRONMENT "GGML_QNN_NO_F16_IO=1"
+        PASS_REGULAR_EXPRESSION "FAIL  slowest compute-time execute under 1000 ms")
 
     # the clamp at GGML_QNN_STATIC_BUDGET_MB=0 (it must still bite), and the denylist under
     # GGML_QNN_NO_OPT, where file entries are advisory. each mode sets its variable itself

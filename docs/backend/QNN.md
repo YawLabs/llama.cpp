@@ -16,7 +16,7 @@ time and the QAIRT runtime DLLs (`QnnHtp.dll` and its dependencies) at run time,
 
 | What | State |
 |---|---|
-| `test-backend-ops` MUL_MAT (F32/F16 weights) | 47/47 pass via `ctest -R test-backend-ops-qnn`; one 46/47 flake seen in five runs, undiagnosed |
+| `test-backend-ops` MUL_MAT (F32/F16 weights) | 47/47 pass via `ctest -R test-backend-ops-qnn`, 40 of 40 clean on an idle machine; one 46/47 was seen once under heavy machine load and has not reproduced on either IO path |
 | Single-matmul kernel throughput (burst clocks + static weights) | no figure claimed: the August 2026 numbers were taken without recording box load and have not been re-taken |
 | Real-model inference | completes, no hangs; unsupported shapes fall back to the CPU automatically |
 | End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | no valid NPU figure yet: the one 4B sweep's NPU leg never executed a matmul on the HTP (see the retraction under Measured comparison); unmeasured on 9-14B |
@@ -336,8 +336,10 @@ The lifecycle binary (`tests/test-qnn-lifecycle.cpp`) registers 32 ctest entries
 or mode variant each; the header comment of that file describes every mode:
 
 - core behavior: `test-qnn-basic`, `test-qnn-budget`, `test-qnn-denylist`,
-  `test-qnn-denylist-noopt`, `test-qnn-watchdog`, `test-qnn-fault`, `test-qnn-clamp`,
-  `test-qnn-clamp-unlimited`, `test-qnn-health`
+  `test-qnn-denylist-noopt`, `test-qnn-denylist-probe`, `test-qnn-watchdog`, `test-qnn-fault`,
+  `test-qnn-clamp`, `test-qnn-clamp-unlimited`, `test-qnn-health`, `test-qnn-health-control`
+- op-level correctness against the CPU: `test-backend-ops-qnn`, which runs `test-backend-ops -b QNN
+  -o MUL_MAT` with `GGML_QNN_NPAD=32` and `GGML_QNN_MIN_DIM=1` and fails if it executed zero cases
 - model-scale bakes and their env variants: `test-qnn-modelscale`,
   `test-qnn-modelscale-npad0`, `test-qnn-noopt`, `test-qnn-modelscale-nostatic`,
   `test-qnn-modelscale-noburst`, `test-qnn-modelscale-shm`
@@ -345,7 +347,7 @@ or mode variant each; the header comment of that file describes every mode:
   `test-qnn-elementwise`, `test-qnn-elementwise-on`, `test-qnn-loadprobe`, `test-qnn-envparse`
 - sessions and weight paths: `test-qnn-reuse`, `test-qnn-dyncache`, `test-qnn-quantized`
 - the test-only hooks `GGML_QNN_DELAY_EXECUTE` and `GGML_QNN_FAIL_FINALIZE`, on small F32
-  graphs that execute in milliseconds even where the fp16 path is slow:
+  graphs that execute in milliseconds, so the injected delays and failures are the only slow part:
   `test-qnn-slow-validate`, `test-qnn-slow-compute`, `test-qnn-validate-timeout`,
   `test-qnn-validate-timeout-cold`, `test-qnn-compute-timeout`, `test-qnn-finalize-error`,
   `test-qnn-denylist-append`
@@ -355,7 +357,10 @@ runs with `GGML_QNN_SLOW_EXEC_MS=0` unless the mode sets it itself; only health 
 value the caller exported). `test-qnn-health` is the one that does: it fails when a
 model-scale F16-weight matmul takes a second or more to execute, and its verdict only
 means something with nothing else running on the machine, because other load slows the
-execute too.
+execute too. `test-qnn-health-control` guards it: it reruns health with
+`GGML_QNN_NO_F16_IO=1`, which restores the old mixed-dtype matmul that took about 13 s, and
+passes only if health fails for that reason - on its own slow-execute check, not on a crash or
+a missing DLL. A health test that went blind would turn the control red.
 `test-qnn-watchdog`, `test-qnn-slow-validate`, `test-qnn-slow-compute`,
 `test-qnn-validate-timeout`, `test-qnn-validate-timeout-cold` and `test-qnn-compute-timeout`
 keep a degraded session on purpose and end the process without DLL detach; ctest judges
