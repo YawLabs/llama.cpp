@@ -559,22 +559,32 @@ endif()
 if (GGML_QNN)
     # upstream b78a39a2f turned test-backend-ops into a build-only target and runs it from
     # ci/run.sh instead. that drops it from ctest, and it is this backend's MUL_MAT correctness
-    # evidence, so a QNN build registers it again. guarded both ways: TARGET because a future
-    # upstream rename would otherwise fail the configure, NOT TEST so this is a no-op the day
-    # upstream registers it itself
-    if (TARGET test-backend-ops AND NOT TEST test-backend-ops)
-        llama_test(test-backend-ops LABEL main)
+    # evidence, so a QNN build registers it again - through a driver, because registering the
+    # binary directly passes VACUOUSLY: at the default pad bucket every test shape is declined
+    # by supports_op and it still prints OK. see test-backend-ops-qnn.cmake
+    if (TARGET test-backend-ops AND NOT TEST test-backend-ops-qnn)
+        llama_test_cmd(
+            ${CMAKE_COMMAND}
+            NAME test-backend-ops-qnn
+            ARGS -DBIN=$<TARGET_FILE:test-backend-ops>
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-ops-qnn.cmake
+        )
+        set_tests_properties(test-backend-ops-qnn PROPERTIES TIMEOUT 600)
     endif()
 
     # the HTP is single-client: the tests that can open the QNN device (any model load or
     # backend enumeration) must not overlap EACH OTHER under ctest -j. the test-qnn-* entries
     # need nothing from this block, they are RUN_SERIAL already and so exclude every other test
     get_property(_qnn_all_tests DIRECTORY PROPERTY TESTS)
+    # test-save-load-state and test-generate-models are deliberately absent: upstream keeps
+    # them behind if(NOT WIN32 OR NOT BUILD_SHARED_LIBS) because they call internals not
+    # exported with LLAMA_API, and this backend only builds Windows ARM64 with shared libs.
+    # They therefore cannot contend for the HTP here. Nothing to serialize, nothing to fix.
     set(_qnn_serial_tests
-        test-backend-ops test-thread-safety test-model-load-cancel test-autorelease
-        test-save-load-state test-state-restore-fragmented test-backend-sampler
+        test-backend-ops-qnn test-thread-safety test-model-load-cancel test-autorelease
+        test-state-restore-fragmented test-backend-sampler
         test-opt test-gguf
-        test-list-devices-output test-generate-models)
+        test-list-devices-output)
     foreach (_test IN LISTS _qnn_all_tests)
         if (_test MATCHES "^test-tokenizer-[01]-" OR _test MATCHES "^test-recurrent-state-rollback")
             list(APPEND _qnn_serial_tests ${_test})
