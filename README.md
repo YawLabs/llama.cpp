@@ -14,39 +14,55 @@
 
 An experimental ggml backend (`ggml/src/ggml-qnn/`) that runs matmuls on the Hexagon NPU
 through QNN (Qualcomm AI Engine Direct) on Windows ARM64 - no test-signing, no custom DSP
-kernels, only the QAIRT community SDK headers at build time and `QnnHtp.dll` at run time.
+kernels, only the QAIRT community SDK headers at build time and the QAIRT runtime DLLs at
+run time (plus `ADSP_LIBRARY_PATH` on QAIRT 2.45 and newer; see the docs' Requirements).
 Developed and measured on a Snapdragon X Elite (X1E80100, HTP v73).
 
-Measured on that machine:
+On that machine:
 
-- **6-11 TFLOP/s fp16** single-matmul kernel throughput with burst clocks + static-baked
-  weights (vs ~0.17 TFLOP/s naive per-op execution on the same hardware - the two changes,
-  a DCVS TURBO power config worth 2-2.5x and baking weights once in HTP-native layout, are
-  together worth up to 64x on deep-K shapes)
-- **45/45** `test-backend-ops` MUL_MAT correctness (F32/F16), clean process exit, plus a
-  dedicated lifecycle suite (`tests/test-qnn-lifecycle.cpp`, 13 registered ctest entries)
-  covering static-weight bakes vs the CPU reference, the memory budget, the failed-shape
-  denylist, watchdog degradation, and the shared-memory IO path
-- **No hangs on real models**: every shape is built, finalized and test-executed before the
-  backend claims it; shapes the HTP rejects or that wedge it land in an in-process denylist
-  (persisted across runs when `GGML_QNN_DENYLIST` points at a file) and run on the CPU
-  instead. Configurations that previously wedged the machine now complete with graceful
-  fallback
+- **No throughput figure is claimed.** The single-matmul kernel numbers this list used to
+  lead with were taken in August 2026 without recording what else was running on the
+  machine - the same flaw that later invalidated a round of model-run timings (see the
+  retraction in the docs) - so they are withdrawn rather than repeated. The two mechanisms
+  they were meant to show are real and still in the code: a DCVS TURBO power config, and
+  baking a weight once into the HTP-native layout instead of re-tiling it on every
+  execute. What either is worth on an idle machine is an open question
+- **45/45** `test-backend-ops` MUL_MAT correctness (F32/F16) with a clean process exit -
+  observed clean on the recorded runs (2026-08-28 ctest log, 2026-09-16), including with a
+  live or degraded HTP session, though a teardown crash inside `QnnHtp.dll` stays listed as
+  a known limitation in the docs - plus a dedicated lifecycle suite
+  (`tests/test-qnn-lifecycle.cpp`, 32 registered ctest entries) covering static-weight bakes
+  vs the CPU reference, the memory budget, the failed-shape denylist, watchdog degradation,
+  the shared-memory IO path, and injected execute failures, finalize errors and execute delays
+- **No hangs on real models**: the load-time probe answers from type, shape and buffer
+  policy, and a resident weight is trial-built, finalized and test-executed at schedule
+  time before the backend claims it; shapes the HTP rejects or that wedge it land in an
+  in-process denylist (finalize errors and watchdog timeouts are also persisted across runs when `GGML_QNN_DENYLIST` points at a file; the docs give the exact rule) and
+  run on the CPU instead, and a matmul whose padded IO would reach `GGML_QNN_IO_MAX_KB` is
+  refused up front. A wedge costs one watchdog timeout (15 s for any execute, the validation execute included, and 120 s for a graph finalize)
+  and a CPU fallback, not a hung process; configurations that previously
+  wedged the machine now complete
 - Quantized weights (Q4/Q5/...) enter the NPU path by being dequantized to fp16 once at bake
-  time, within a memory budget (default 2048 MB); one padded graph per weight serves every
-  prompt length
+  time, within a memory budget (default 1024 MB); one padded graph per weight serves every
+  N up to `GGML_QNN_NPAD`, larger ubatches get one graph and bake per power-of-two bucket,
+  each charged to the budget, and buckets over the IO cap are refused. On a KleidiAI+REPACK
+  build, K-quant weights reach the NPU only with `-dev QNN` and a `GGML_QNN_NPAD` that fits the weight width (see the docs)
 - **A characterized failure law instead of a mystery**: graph execute hangs when a padded IO
   buffer crosses a runtime-dependent size threshold (~1-1.5 MB measured), and works at any
   weight size below it - model-scale bakes (512x2560) pass with a small pad bucket
-  (`GGML_QNN_NPAD=64`). See the docs for the tuning guidance
+  (`GGML_QNN_NPAD=64`; a 4096-wide projection needs 32), and `GGML_QNN_IO_MAX_KB` (default 1024) refuses a shape at the cap
+  instead of letting it hang. See the docs for the tuning guidance
 - Composes with the other backends in one binary: KleidiAI CPU + Adreno GPU (OpenCL) + NPU
 
-What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end on dense 9-14B
-models - per-op scheduling and IO copies currently eat the kernel advantage, and decode is not
-claimed for the NPU, so it runs on the CPU (the Adreno is measurably faster at decode than
-the CPU, so decode is not simply bandwidth-bound as previously stated). The measured case
-for fixing this with ahead-of-time compiled context binaries (a serialized context reloads
-~8x faster than a fresh finalize) is in [docs/backend/QNN.md](docs/backend/QNN.md).
+What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end. The one 4B
+sweep has no valid NPU figure - its "NPU" leg never executed a matmul on the HTP, because
+the K-quant weights were repacked out of the NPU's reach and the one trial build stalled on
+the IO-size law (the docs carry the retraction) - and 9-14B models are unmeasured. Decode
+is not claimed for the NPU below 32-token ubatches, so it runs on the CPU; on the
+settled-pack run the two measured engines (GPU, CPU) and the CPU-run leg labelled NPU converge on decode. The case for fixing prefill
+with ahead-of-time compiled context binaries (a serialized context is reloaded instead of
+finalized again; the timings that sized that win have not been re-taken) is in
+[docs/backend/QNN.md](docs/backend/QNN.md).
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -128,6 +144,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [Metal](docs/build.md#metal-build) | Apple Silicon |
 | [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
 | [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
+| [QNN](docs/backend/QNN.md) | Hexagon NPU (Windows on ARM) |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
 | [SYCL](docs/backend/SYCL.md) | Intel GPU |
 | [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
