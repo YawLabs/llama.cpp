@@ -482,7 +482,87 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
         return nullptr;
     }
 
-    err = sess->iface.deviceCreate(sess->log_handle, nullptr, &sess->device_handle);
+    // tell QNN which HTP it is building for. Creating the device with a null config leaves the
+    // arch unset, and the backend then falls back to a generic path that computes the RIGHT
+    // numbers at roughly scalar speed - which is exactly the symptom measured on 2026-09-23:
+    // one 84 M-MAC fp16 matmul took 13.1 s on an idle box, while Genie, whose own
+    // htp_backend_ext_config.json declares soc_model 60 / dsp_arch v73, ran a whole 4B model on
+    // the same HTP in 17.6 s. The arch is QUERIED from the device rather than hardcoded so this
+    // stays correct on any SoC; GGML_QNN_HTP_ARCH (68, 69, 73, 75, 79, 81, 85, 89) forces it
+    // when the query is unavailable, and 0 restores the old null-config behaviour for A/B.
+    QnnHtpDevice_Arch_t htp_arch  = QNN_HTP_DEVICE_ARCH_NONE;
+    uint32_t            soc_model = 0;
+
+    const QnnDevice_PlatformInfo_t * platform = nullptr;
+    if (sess->iface.deviceGetPlatformInfo &&
+        sess->iface.deviceGetPlatformInfo(sess->log_handle, &platform) == QNN_SUCCESS && platform) {
+        if (platform->version == QNN_DEVICE_PLATFORM_INFO_VERSION_1) {
+            for (uint32_t i = 0; i < platform->v1.numHwDevices; i++) {
+                const QnnDevice_HardwareDeviceInfo_t & hw = platform->v1.hwDevices[i];
+                if (hw.version != QNN_DEVICE_HARDWARE_DEVICE_INFO_VERSION_1) {
+                    continue;
+                }
+                const QnnHtpDevice_DeviceInfoExtension_t * ext =
+                    (const QnnHtpDevice_DeviceInfoExtension_t *) hw.v1.deviceInfoExtension;
+                if (ext && ext->devType == QNN_HTP_DEVICE_TYPE_ON_CHIP) {
+                    htp_arch  = ext->onChipDevice.arch;
+                    soc_model = ext->onChipDevice.socModel;
+                    break;
+                }
+            }
+        }
+        if (sess->iface.deviceFreePlatformInfo) {
+            sess->iface.deviceFreePlatformInfo(sess->log_handle, platform);
+        }
+    }
+
+    const long long arch_env = ggml_qnn_env_ll("GGML_QNN_HTP_ARCH", -1, -1);
+    if (arch_env >= 0) {
+        htp_arch = (QnnHtpDevice_Arch_t) arch_env; // 0 (NONE) deliberately reverts to no config
+    }
+
+    QnnHtpDevice_CustomConfig_t cc_arch = {};
+    cc_arch.option        = QNN_HTP_DEVICE_CONFIG_OPTION_ARCH;
+    cc_arch.arch.arch     = htp_arch;
+    cc_arch.arch.deviceId = 0;
+
+    QnnHtpDevice_CustomConfig_t cc_soc = {};
+    cc_soc.option   = QNN_HTP_DEVICE_CONFIG_OPTION_SOC;
+    cc_soc.socModel = soc_model;
+
+    QnnDevice_Config_t cfg_arch = {};
+    cfg_arch.option       = QNN_DEVICE_CONFIG_OPTION_CUSTOM;
+    cfg_arch.customConfig = &cc_arch;
+
+    QnnDevice_Config_t cfg_soc = {};
+    cfg_soc.option       = QNN_DEVICE_CONFIG_OPTION_CUSTOM;
+    cfg_soc.customConfig = &cc_soc;
+
+    // 0x7fffffff is the UNKNOWN sentinel, not a SoC: this device reports it, and forwarding it
+    // as a SOC config names a SoC that does not exist. GGML_QNN_SOC_MODEL supplies the real one
+    // (60 = X Elite, the value Genie uses) for anyone who wants to try it
+    const long long soc_env = ggml_qnn_env_ll("GGML_QNN_SOC_MODEL", 0, 0);
+    if (soc_env > 0) {
+        soc_model = (uint32_t) soc_env;
+    }
+    if (soc_model == 0x7fffffffu) {
+        soc_model = 0;
+    }
+    cc_soc.socModel = soc_model;
+
+    // the SoC entry is only added when the device reported one: passing 0 would name no SoC
+    const QnnDevice_Config_t * cfg_both[] = { &cfg_arch, &cfg_soc, nullptr };
+    const QnnDevice_Config_t * cfg_only[] = { &cfg_arch, nullptr };
+    const QnnDevice_Config_t ** dev_cfg   = nullptr;
+    if (htp_arch != QNN_HTP_DEVICE_ARCH_NONE) {
+        dev_cfg = soc_model ? cfg_both : cfg_only;
+        GGML_LOG_INFO("ggml-qnn: HTP arch v%d, SoC model %u\n", (int) htp_arch, soc_model);
+    } else {
+        GGML_LOG_WARN("ggml-qnn: HTP arch unknown, creating the device without one - expect "
+                      "correct results at reference speed; set GGML_QNN_HTP_ARCH (e.g. 73)\n");
+    }
+
+    err = sess->iface.deviceCreate(sess->log_handle, dev_cfg, &sess->device_handle);
     if (err != QNN_SUCCESS) {
         GGML_LOG_INFO("ggml-qnn: no HTP device available, QnnDevice_create failed: %" PRIu64 "\n", (uint64_t) err);
         ggml_qnn_session_free(sess);
@@ -801,10 +881,26 @@ static std::string ggml_qnn_graph_key(const ggml_tensor * node) {
 // the first refusal of the process is a WARN that names the way out: with -dev QNN at the
 // default GGML_QNN_NPAD every weight of a 4B model is refused here, and at DEBUG alone the
 // user who asked for the NPU got a CPU run with no line saying why
+// the mixed-dtype matmul this replaces ran 400-950x slower than the same shape with an f32
+// weight; see ggml_qnn_graph::f16_io. Off only for reproducing that
+static bool ggml_qnn_no_f16_io() {
+    static const bool off = getenv("GGML_QNN_NO_F16_IO") != nullptr;
+    return off;
+}
+
+// graph IO is fp16 whenever the weight is, so the cap must measure the bytes the graph will
+// really allocate. Counting 4 per element there refuses shapes that now fit in half the space
+static uint64_t ggml_qnn_io_elem_size(const ggml_tensor * node) {
+    const bool f16 = !ggml_qnn_no_f16_io() && node->op == GGML_OP_MUL_MAT &&
+                     ggml_qnn_weight_dtype(node->src[0]->type) == QNN_DATATYPE_FLOAT_16;
+    return f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+}
+
 static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
     static const uint64_t cap = (uint64_t) ggml_qnn_env_ll("GGML_QNN_IO_MAX_KB", 1024, 1) * 1024;
-    const uint64_t in_bytes  = (uint64_t) node->src[1]->ne[0] * pad * sizeof(float);
-    const uint64_t out_bytes = (uint64_t) node->src[0]->ne[1] * pad * sizeof(float);
+    const uint64_t elem      = ggml_qnn_io_elem_size(node);
+    const uint64_t in_bytes  = (uint64_t) node->src[1]->ne[0] * pad * elem;
+    const uint64_t out_bytes = (uint64_t) node->src[0]->ne[1] * pad * elem;
     if (std::max(in_bytes, out_bytes) < cap) {
         return false;
     }
@@ -821,7 +917,7 @@ static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
     }
     if (!warned) {
         // the largest power-of-two batch whose padded IO still fits under the cap
-        const uint64_t row_bytes = std::max<uint64_t>(node->src[1]->ne[0], node->src[0]->ne[1]) * sizeof(float);
+        const uint64_t row_bytes = std::max<uint64_t>(node->src[1]->ne[0], node->src[0]->ne[1]) * elem;
         uint32_t fit = 0;
         for (uint32_t p = 1; (uint64_t) p * row_bytes < cap; p <<= 1) {
             fit = p;
@@ -851,7 +947,8 @@ bool ggml_qnn_mul_mat_arith_reject(const ggml_tensor * op, bool placement_probe)
     const uint32_t Nb = ggml_qnn_pad_n(placement_probe ? 1 : (uint32_t) op->src[1]->ne[1]);
 
     // the padded IO buffer sizes must fit the uint32_t QNN takes
-    if (K * Nb * sizeof(float) > UINT32_MAX || M * Nb * sizeof(float) > UINT32_MAX) {
+    const size_t io_elem = ggml_qnn_io_elem_size(op);
+    if (K * Nb * io_elem > UINT32_MAX || M * Nb * io_elem > UINT32_MAX) {
         return true;
     }
     // a padded IO buffer at or past the cap hangs the execute (the padded-IO size law)
@@ -936,9 +1033,16 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
     const uint32_t M = (uint32_t) src0->ne[1];
     const uint32_t Nb = g.n_pad; // filled by ggml_qnn_mul_mat_policy before graphCreate
 
+    // see ggml_qnn_graph::f16_io - with an fp16 weight the whole matmul is declared fp16, so
+    // the activation is converted on the way in and the result on the way out.
+    // GGML_QNN_NO_F16_IO restores the old mixed-dtype behaviour, which is 400x slower and only
+    // useful for reproducing the bug
+    g.f16_io = !ggml_qnn_no_f16_io() && ggml_qnn_weight_dtype(src0->type) == QNN_DATATYPE_FLOAT_16;
+    const Qnn_DataType_t io_dtype = g.f16_io ? QNN_DATATYPE_FLOAT_16 : QNN_DATATYPE_FLOAT_32;
+
     // ggml: dst(NxM row-major) = src1(NxK) * src0(MxK)^T
     g.inputs.resize(g.weights_static ? 1 : 2);
-    if (!ggml_qnn_tensor_init(sess, g, g.inputs[0], "in0", QNN_TENSOR_TYPE_APP_WRITE, {Nb, K}, QNN_DATATYPE_FLOAT_32)) {
+    if (!ggml_qnn_tensor_init(sess, g, g.inputs[0], "in0", QNN_TENSOR_TYPE_APP_WRITE, {Nb, K}, io_dtype)) {
         return false;
     }
 
@@ -957,7 +1061,7 @@ static bool ggml_qnn_build_mul_mat(ggml_qnn_session * sess, ggml_qnn_graph & g, 
         }
     }
 
-    if (!ggml_qnn_tensor_init(sess, g, g.output, "out", QNN_TENSOR_TYPE_APP_READ, {Nb, M}, QNN_DATATYPE_FLOAT_32)) {
+    if (!ggml_qnn_tensor_init(sess, g, g.output, "out", QNN_TENSOR_TYPE_APP_READ, {Nb, M}, io_dtype)) {
         return false;
     }
 
@@ -1202,7 +1306,7 @@ static void ggml_qnn_aot_roundtrip(ggml_qnn_session * sess, const std::string & 
 static size_t ggml_qnn_input_size(const ggml_qnn_graph & g, const ggml_tensor * node, size_t i) {
     if (node->op == GGML_OP_MUL_MAT) {
         if (i == 0) {
-            return (size_t) node->src[1]->ne[0] * g.n_pad * sizeof(float);
+            return (size_t) node->src[1]->ne[0] * g.n_pad * (g.f16_io ? sizeof(ggml_fp16_t) : sizeof(float));
         }
         return g.weight_quantized ? (size_t) ggml_nelements(node->src[0]) * sizeof(ggml_fp16_t)
                                   : ggml_nbytes(node->src[0]);
@@ -1212,7 +1316,7 @@ static size_t ggml_qnn_input_size(const ggml_qnn_graph & g, const ggml_tensor * 
 
 static size_t ggml_qnn_output_size(const ggml_qnn_graph & g, const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT) {
-        return (size_t) node->src[0]->ne[1] * g.n_pad * sizeof(float);
+        return (size_t) node->src[0]->ne[1] * g.n_pad * (g.f16_io ? sizeof(ggml_fp16_t) : sizeof(float));
     }
     return ggml_nbytes(node);
 }
@@ -1713,7 +1817,13 @@ enum ggml_status ggml_qnn_compute_node(ggml_qnn_session * sess, struct ggml_tens
         case GGML_OP_MUL_MAT: {
             // MatMul in0 is the activations (src1), in1 is the weights (src0). only the real
             // N rows are copied, the padded tail rows produce output rows nobody reads
-            memcpy(ggml_qnn_input_ptr(g, 0), node->src[1]->data, ggml_nbytes(node->src[1]));
+            if (g->f16_io) {
+                ggml_fp32_to_fp16_row((const float *) node->src[1]->data,
+                                      (ggml_fp16_t *) ggml_qnn_input_ptr(g, 0),
+                                      ggml_nelements(node->src[1]));
+            } else {
+                memcpy(ggml_qnn_input_ptr(g, 0), node->src[1]->data, ggml_nbytes(node->src[1]));
+            }
             if (g->weights_static) {
                 break;
             }
@@ -1794,7 +1904,12 @@ enum ggml_status ggml_qnn_compute_node(ggml_qnn_session * sess, struct ggml_tens
         return GGML_STATUS_FAILED;
     }
 
-    memcpy(node->data, ggml_qnn_output_ptr(g), ggml_nbytes(node));
+    if (g->f16_io) {
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *) ggml_qnn_output_ptr(g), (float *) node->data,
+                              ggml_nelements(node));
+    } else {
+        memcpy(node->data, ggml_qnn_output_ptr(g), ggml_nbytes(node));
+    }
 
     // the slow-device check of the validation execute, for a device that slows down after its
     // graphs validated (a cache hit never re-validates). the result above is valid, so this

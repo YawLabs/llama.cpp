@@ -628,11 +628,14 @@ static int scenario_basic(void) {
         }
     }
 
-    // N=513 pads to 1024, so at K=256 in0 is exactly 1 MiB: the cap is strict, so this is a
-    // policy refusal taken before graphCreate. it must not degrade the session, which the
-    // compute after the reacquire below would show
-    const mul_mat_case capped = { GGML_TYPE_F16, 256, 128, 513 };
-    check(!probe_claim(qnn, capped), "256x128 N=513 refused: padded input reaches GGML_QNN_IO_MAX_KB");
+    // N=513 pads to 1024, and graph IO for an fp16 weight is fp16 too, so a row element is
+    // 2 bytes: at K=512 in0 is exactly 1 MiB. The cap is strict, so this is a policy refusal
+    // taken before graphCreate. It must not degrade the session, which the compute after the
+    // reacquire below would show. (K was 256 while IO was fp32 - halving the element size
+    // doubled the K that reaches the cap, which is the point of the fix, so this case moved
+    // with it rather than being weakened.)
+    const mul_mat_case capped = { GGML_TYPE_F16, 512, 128, 513 };
+    check(!probe_claim(qnn, capped), "512x128 N=513 refused: padded input reaches GGML_QNN_IO_MAX_KB");
 
     // probe/free/reacquire: llama frees all backends between model probe and context creation;
     // the backend must survive the cycle and still compute

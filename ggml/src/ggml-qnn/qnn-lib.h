@@ -33,6 +33,16 @@ struct ggml_qnn_graph {
     // weights baked into the graph at finalize, see ggml_qnn_weights_static
     Qnn_Tensor_t weights = {};
     bool weights_static = false;
+    // Declare the activation and output FLOAT_16, not FLOAT_32, when the weight is FLOAT_16,
+    // so the whole matmul is one dtype. A mixed fp16-weight/fp32-activation matmul drops to a
+    // reference kernel on the HTP: measured 2026-09-23 on an idle box, the SAME shape ran
+    // 208.9 ms mixed against 0.5 ms uniform (418x), and test-qnn-health went from 13099 ms to
+    // 0 ms, with test-backend-ops at 47/47 either way. On by default; GGML_QNN_NO_F16_IO
+    // restores the slow path for reproducing the bug. Set per graph and read by the IO sizing,
+    // the cap arithmetic and both copies - every site must agree or the device reads the wrong
+    // bytes. NOTE: the shape key does not encode this, so a denylist FILE written by an older
+    // build can ban shapes that are now fast; delete a stale GGML_QNN_DENYLIST file.
+    bool f16_io = false;
     // matmul graphs are built with the batch dim N padded up to a power-of-two bucket
     // (GGML_QNN_NPAD is the floor, default 512), for both the static-baked and the dynamic
     // variant: one graph serves every N in the bucket, so a weight bakes once and a LoRA or
