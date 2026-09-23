@@ -639,6 +639,10 @@ struct ggml_backend_opencl_context {
     cl_program_cache_state program_cache;
     bool program_cache_initialized = false;
 
+    // Buffers alloc_buffer had to land in the host-pinned pool because the device pool was exhausted.
+    // The first one is reported on stderr instead of GGML_LOG_WARN, which llama-bench without -v drops.
+    int n_host_pinned_fallbacks = 0;
+
     // prealloc buffers for transposing weights and activations
     ggml_cl_buffer prealloc_quant_trans;
     ggml_cl_buffer prealloc_scales_trans;
@@ -7736,6 +7740,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             // non-contiguous tensor with the same ne -- is read with the wrong strides and
             // produces garbage rather than being declined. Decline non-contiguous layouts, as
             // the CUDA and Vulkan backends already do.
+            // Drop this gate when rebasing past upstream #28503 (7d701b592), which passes the nb00/nb10 strides to the kernel.
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op)) &&
                    ((op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
                     (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
@@ -8492,22 +8497,92 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
     return GGML_STATUS_SUCCESS;
 }
 
+// The clCreateBuffer (and clEnqueueWriteBuffer) failures that mean "out of
+// memory": the only ones a clFinish retry or the host-pinned pool can cure, so
+// those two steps skip an allocation that failed with anything else.
+static bool ggml_cl_alloc_err_is_oom(cl_int err) {
+    return err == CL_MEM_OBJECT_ALLOCATION_FAILURE || err == CL_OUT_OF_RESOURCES || err == CL_OUT_OF_HOST_MEMORY;
+}
+
+// One remediation for every site that gives up on the device memory pool.
+static const char * ggml_cl_pool_exhausted_hint =
+    "the device memory pool is likely exhausted. Reduce -ngl (or omit it so the layer count can be fitted automatically), "
+    "lower -c / -ub, use a quantized KV cache (-ctk q8_0 -ctv q8_0), or use a smaller model";
+
+// clCreateBuffer with one clFinish-and-retry. On Adreno X1-85 the device pool
+// intermittently fails at hundreds of MB once the heap fragments, and draining
+// the queue releases the buffers of in-flight commands (the pattern proven at
+// the FD-split partial buffer alloc). Only an out-of-memory error is retried;
+// anything else, notably CL_INVALID_BUFFER_SIZE for a request above
+// CL_DEVICE_MAX_MEM_ALLOC_SIZE, is returned as-is since draining the queue
+// cannot cure it. The caller decides which other pool, if any, still can.
+static cl_mem ggml_cl_create_buffer_retry(cl_context context, cl_command_queue queue, cl_mem_flags flags, size_t nbytes, cl_int * err) {
+    cl_mem buf = clCreateBuffer(context, flags, nbytes, NULL, err);
+    if (ggml_cl_alloc_err_is_oom(*err)) {
+        clFinish(queue);
+        buf = clCreateBuffer(context, flags, nbytes, NULL, err);
+    }
+    return buf;
+}
+
+// The diagnosis for a staging or buffer failure the caller could not recover
+// from. `verb` is the call that returned `err` ("allocate" for clCreateBuffer,
+// "write" for clEnqueueWriteBuffer) and `note`, when not NULL, says which
+// fallbacks ran or remain. Only an out-of-memory error blames the pool;
+// CL_INVALID_BUFFER_SIZE names the request and the device's
+// CL_DEVICE_MAX_MEM_ALLOC_SIZE instead, and claims that nothing can satisfy it
+// only when the caller has no note, i.e. no cl_qcom_large_buffer step to point at.
+static std::string ggml_cl_alloc_failure_msg(cl_command_queue queue, const char * verb, const char * what, const char * tensor_name, size_t nbytes, cl_int err, const char * note) {
+    char head[256];
+    snprintf(head, sizeof(head), "failed to %s a %.2f MiB %s", verb, nbytes / 1024.0 / 1024.0, what);
+    std::string msg = head;
+    if (tensor_name) {
+        msg += " for tensor '";
+        msg += tensor_name;
+        msg += "'";
+    }
+    if (err == CL_INVALID_BUFFER_SIZE) {
+        cl_device_id device = NULL;
+        size_t max_alloc = 0;
+        if (clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(device), &device, NULL) == CL_SUCCESS) {
+            clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
+        }
+        char limit[160];
+        snprintf(limit, sizeof(limit), ": the size is above CL_DEVICE_MAX_MEM_ALLOC_SIZE (%.2f MiB)%s",
+                 max_alloc / 1024.0 / 1024.0, note ? "" : ", which no retry or other pool can satisfy");
+        msg += limit;
+    }
+    msg += " (CL error " + std::to_string(err);
+    if (note) {
+        msg += "; ";
+        msg += note;
+    }
+    msg += ")";
+    if (ggml_cl_alloc_err_is_oom(err)) {
+        msg += "; ";
+        msg += ggml_cl_pool_exhausted_hint;
+    }
+    return msg;
+}
+
 // Allocate a temporary upload buffer of `nbytes` and populate it with `data`
 // from host. On Adreno X1-85 the device-only pool intermittently fails to
 // allocate at hundreds of MB once model weights fragment the heap (observed
 // on Qwen3.5-9B output.weight Q6_K at 834 MB). Three-step retry:
 //   1. CL_MEM_READ_WRITE alloc + clEnqueueWriteBuffer (normal fast path).
-//   2. clFinish + retry (drains in-flight allocs that may be holding heap;
-//      mirrors the proven pattern at the FD-split partial buffer alloc).
-//   3. CL_MEM_ALLOC_HOST_PTR + map(WRITE_INVALIDATE) + memcpy + unmap —
+//   2. clFinish + retry (ggml_cl_create_buffer_retry).
+//   3. CL_MEM_ALLOC_HOST_PTR + map(WRITE_INVALIDATE) + memcpy + unmap --
 //      different memory pool (host-pinned); true zero-copy on Adreno per
 //      QCOM guidance. (CL_MEM_USE_HOST_PTR is NOT zero-copy on Adreno: the
 //      driver triggers an internal copy because arbitrary host pages aren't
 //      guaranteed mappable/coherent, AND it draws from the same exhausted
-//      device pool — so it doesn't solve the problem.)
+//      device pool -- so it doesn't solve the problem.)
+// Steps 2 and 3 only run for an out-of-memory allocation error; any other one
+// aborts at once with its own diagnosis. A failed write of any class goes to
+// step 3, which does not use clEnqueueWriteBuffer.
 // Returns the ready-to-read buffer (caller must clReleaseMemObject); aborts
 // with a diagnosis on stderr if all three strategies fail. The buffer is
-// opaque to the caller — it can be passed as a kernel argument like any
+// opaque to the caller -- it can be passed as a kernel argument like any
 // normal cl_mem.
 static cl_mem ggml_cl_create_temp_upload_buffer(
     cl_context context, cl_command_queue queue,
@@ -8515,25 +8590,31 @@ static cl_mem ggml_cl_create_temp_upload_buffer(
     const char * tensor_name_for_log)
 {
     cl_int err;
-    cl_mem buf = clCreateBuffer(context, CL_MEM_READ_WRITE, nbytes, NULL, &err);
-    if (err != CL_SUCCESS) {
-        clFinish(queue);
-        buf = clCreateBuffer(context, CL_MEM_READ_WRITE, nbytes, NULL, &err);
-    }
+    cl_int werr = CL_SUCCESS;
+    cl_mem buf = ggml_cl_create_buffer_retry(context, queue, CL_MEM_READ_WRITE, nbytes, &err);
     if (err == CL_SUCCESS) {
-        const cl_int werr = clEnqueueWriteBuffer(queue, buf, CL_TRUE, 0, nbytes, data, 0, NULL, NULL);
+        // Adreno allocates lazily, so the device pool can also run out here. Whatever the write
+        // returned, the host-pinned path below is still worth a try: it maps instead of writing.
+        werr = clEnqueueWriteBuffer(queue, buf, CL_TRUE, 0, nbytes, data, 0, NULL, NULL);
         if (werr == CL_SUCCESS) {
             return buf;
         }
         clReleaseMemObject(buf);
+    } else if (!ggml_cl_alloc_err_is_oom(err)) {
+        // abort with the diagnosis on stderr: GGML_LOG_ERROR goes through an async logger that can lose the line before the process dies
+        GGML_ABORT("ggml_opencl: %s", ggml_cl_alloc_failure_msg(queue, "allocate", "temp upload buffer", tensor_name_for_log, nbytes, err, NULL).c_str());
     }
     buf = clCreateBuffer(context,
         CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR | CL_MEM_HOST_WRITE_ONLY,
         nbytes, NULL, &err);
     if (err != CL_SUCCESS) {
-        // abort with the diagnosis on stderr: GGML_LOG_ERROR goes through an async logger that can lose the line before the process dies
-        GGML_ABORT("ggml_opencl: failed to allocate a %.2f MiB temp upload buffer for tensor '%s' (CL error %d, host-pinned fallback included); the device memory pool is likely exhausted. Reduce -ngl (or omit it so the layer count can be fitted automatically), lower -c / -ub, or use a smaller model.",
-                   nbytes / 1024.0 / 1024.0, tensor_name_for_log ? tensor_name_for_log : "?", err);
+        if (werr != CL_SUCCESS) {
+            // the device buffer was allocated and the write into it failed, so the diagnosis names the write
+            char note[96];
+            snprintf(note, sizeof(note), "the host-pinned fallback could not be allocated either, CL error %d", err);
+            GGML_ABORT("ggml_opencl: %s", ggml_cl_alloc_failure_msg(queue, "write", "temp upload buffer", tensor_name_for_log, nbytes, werr, note).c_str());
+        }
+        GGML_ABORT("ggml_opencl: %s", ggml_cl_alloc_failure_msg(queue, "allocate", "temp upload buffer", tensor_name_for_log, nbytes, err, "host-pinned fallback included").c_str());
     }
     void * mapped = clEnqueueMapBuffer(queue, buf, CL_TRUE,
         CL_MAP_WRITE_INVALIDATE_REGION, 0, nbytes, 0, NULL, NULL, &err);
@@ -8548,8 +8629,8 @@ static cl_mem ggml_cl_create_temp_upload_buffer(
                    nbytes / 1024.0 / 1024.0, tensor_name_for_log ? tensor_name_for_log : "?", uerr);
     }
     if (tensor_name_for_log) {
-        GGML_LOG_INFO("ggml_opencl: %s (%.1f MiB) -- device alloc failed, using CL_MEM_ALLOC_HOST_PTR fallback\n",
-                      tensor_name_for_log, nbytes / 1024.0 / 1024.0);
+        GGML_LOG_INFO("ggml_opencl: %s (%.1f MiB) -- device %s failed, using CL_MEM_ALLOC_HOST_PTR fallback\n",
+                      tensor_name_for_log, nbytes / 1024.0 / 1024.0, werr != CL_SUCCESS ? "write" : "alloc");
     }
     return buf;
 }
@@ -8564,13 +8645,13 @@ static cl_mem ggml_cl_create_temp_download_buffer(
     size_t nbytes, const char * tensor_name_for_log)
 {
     cl_int err;
-    cl_mem buf = clCreateBuffer(context, CL_MEM_READ_WRITE, nbytes, NULL, &err);
-    if (err != CL_SUCCESS) {
-        clFinish(queue);
-        buf = clCreateBuffer(context, CL_MEM_READ_WRITE, nbytes, NULL, &err);
-    }
+    cl_mem buf = ggml_cl_create_buffer_retry(context, queue, CL_MEM_READ_WRITE, nbytes, &err);
     if (err == CL_SUCCESS) {
         return buf;
+    }
+    if (!ggml_cl_alloc_err_is_oom(err)) {
+        // abort with the diagnosis on stderr: GGML_LOG_ERROR goes through an async logger that can lose the line before the process dies
+        GGML_ABORT("ggml_opencl: %s", ggml_cl_alloc_failure_msg(queue, "allocate", "temp download buffer", tensor_name_for_log, nbytes, err, NULL).c_str());
     }
     // READ_WRITE, not WRITE_ONLY: some restore kernels read-modify-write the
     // destination (e.g. kernel_restore_block_q5_k_trans4_ns |=-accumulates qh),
@@ -8579,9 +8660,7 @@ static cl_mem ggml_cl_create_temp_download_buffer(
         CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR | CL_MEM_HOST_READ_ONLY,
         nbytes, NULL, &err);
     if (err != CL_SUCCESS) {
-        // abort with the diagnosis on stderr: GGML_LOG_ERROR goes through an async logger that can lose the line before the process dies
-        GGML_ABORT("ggml_opencl: failed to allocate a %.2f MiB temp download buffer for tensor '%s' (CL error %d, host-pinned fallback included); the device memory pool is likely exhausted.",
-                   nbytes / 1024.0 / 1024.0, tensor_name_for_log ? tensor_name_for_log : "?", err);
+        GGML_ABORT("ggml_opencl: %s", ggml_cl_alloc_failure_msg(queue, "allocate", "temp download buffer", tensor_name_for_log, nbytes, err, "host-pinned fallback included").c_str());
     }
     if (tensor_name_for_log) {
         GGML_LOG_INFO("ggml_opencl: %s download (%.1f MiB) -- device alloc failed, using CL_MEM_ALLOC_HOST_PTR fallback\n",
@@ -11205,48 +11284,73 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     size = std::max(size, (size_t)1);
 
     cl_int err;
-    cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
     // On Adreno X1-85 the device pool intermittently fails at hundreds of MB
     // once the heap fragments (e.g. graph-allocator compute-buffer reserve
     // after model load). Four-step retry:
     //   1. normal alloc (fast path)
-    //   2. clFinish + retry (drains in-flight allocs)
+    //   2. clFinish + retry (ggml_cl_create_buffer_retry)
     //   3. cl_qcom_large_buffer (X2-class driver only, OpenCL 3.0 only)
-    //   4. ALLOC_HOST_PTR (host-pinned pool) — last-resort fallback. This
+    //   4. ALLOC_HOST_PTR (host-pinned pool) -- last-resort fallback. This
     //      buffer backs compute scratch read/written by every kernel in the
     //      graph, so kernel accesses fall to host memory and runtime perf
     //      degrades meaningfully. Better than failing to load, but the user
     //      should see the warning and consider -ngl reduction.
-    if (err != CL_SUCCESS) {
-        clFinish(backend_ctx->queue);
-        mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
-    }
+    // Steps 2 and 4 only run for an out-of-memory error: neither can cure a
+    // CL_INVALID_BUFFER_SIZE for a request above CL_DEVICE_MAX_MEM_ALLOC_SIZE.
+    // Step 3 runs for both, since lifting that limit is what the extension is
+    // for. Any other error fails right away with its own diagnosis.
+    cl_mem mem = ggml_cl_create_buffer_retry(backend_ctx->context, backend_ctx->queue, CL_MEM_READ_WRITE, size, &err);
+    // what the ordinary pool returned: it gates step 4 and picks the diagnosis, whatever step 3 returns
+    const cl_int pool_err = err;
+    bool large_buffer_tried = false;
+    bool large_buffer_unset = false;
+    bool host_pinned_tried  = false;
 #if GGML_OPENCL_TARGET_VERSION >= 300
     // clCreateBufferWithProperties and cl_mem_properties are OpenCL 3.0. Drivers older than
     // that do not export the symbol, so a build targeting them fails to link. The large
     // buffer extension is only ever enabled on drivers that are well past 3.0, so this path
     // is dead there anyway.
-    if (err != CL_SUCCESS && backend_ctx->adreno_use_large_buffer) {
+    if (backend_ctx->adreno_use_large_buffer && (ggml_cl_alloc_err_is_oom(err) || err == CL_INVALID_BUFFER_SIZE)) {
+        large_buffer_tried = true;
         cl_mem_properties props[] = { 0x41A6 /* CL_LARGE_BUFFER_QCOM */, 1, 0 };
         mem = clCreateBufferWithProperties(backend_ctx->context, props, CL_MEM_READ_WRITE, size, NULL, &err);
     }
+    // the driver has the extension and GGML_OPENCL_ADRENO_USE_LARGE_BUFFER did not enable it
+    large_buffer_unset = !backend_ctx->adreno_use_large_buffer && backend_ctx->adreno_has_large_buffer &&
+                         backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
 #endif
-    if (err != CL_SUCCESS) {
+    if (err != CL_SUCCESS && ggml_cl_alloc_err_is_oom(pool_err)) {
+        host_pinned_tried = true;
         mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
                              size, NULL, &err);
         if (err == CL_SUCCESS) {
-            GGML_LOG_WARN("%s: %.2f MiB allocated via CL_MEM_ALLOC_HOST_PTR fallback -- "
-                          "device pool exhausted; runtime perf will be degraded. "
-                          "Consider lowering -ngl or context size.\n",
-                          __func__, size / 1024.0 / 1024.0);
+            // llama-bench without -v installs a null log callback, which drops the WARN, and a bench number measured
+            // on a host-pinned compute buffer must not pass silently. So the first fallback of a backend context
+            // deliberately bypasses ggml_log_set, once, and goes to stderr only; later ones use the WARN.
+            if (backend_ctx->n_host_pinned_fallbacks++ == 0) {
+                fprintf(stderr, "ggml_opencl: device memory pool exhausted, a %.2f MiB buffer was allocated from the host-pinned pool instead; "
+                                "runtime perf will be degraded. Consider lowering -ngl or context size (further fallbacks are logged at warn level).\n",
+                        size / 1024.0 / 1024.0);
+            } else {
+                GGML_LOG_WARN("%s: %.2f MiB allocated via CL_MEM_ALLOC_HOST_PTR fallback -- "
+                              "device pool exhausted; runtime perf will be degraded. "
+                              "Consider lowering -ngl or context size.\n",
+                              __func__, size / 1024.0 / 1024.0);
+            }
         }
     }
 
     if (err != CL_SUCCESS) {
-        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB (err=%d); the device memory pool is "
-                       "likely exhausted. Reduce -ngl, lower -c / -ub, "
-                       "or use quantized KV cache (-ctk q8_0 -ctv q8_0).\n",
-                       __func__, size / 1024.0 / 1024.0, err);
+        char note[160] = "";
+        if (large_buffer_tried || host_pinned_tried) {
+            snprintf(note, sizeof(note), "%s%s%s failed too, last CL error %d",
+                     large_buffer_tried ? "cl_qcom_large_buffer" : "",
+                     large_buffer_tried && host_pinned_tried ? " and " : "",
+                     host_pinned_tried ? "the host-pinned pool" : "", err);
+        } else if (large_buffer_unset && pool_err == CL_INVALID_BUFFER_SIZE) {
+            snprintf(note, sizeof(note), "the driver has cl_qcom_large_buffer, set GGML_OPENCL_ADRENO_USE_LARGE_BUFFER=1 to try it");
+        }
+        GGML_LOG_ERROR("%s: %s\n", __func__, ggml_cl_alloc_failure_msg(backend_ctx->queue, "allocate", "buffer", NULL, size, pool_err, note[0] ? note : NULL).c_str());
         return nullptr;
     }
 
