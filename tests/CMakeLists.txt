@@ -557,6 +557,15 @@ if (TARGET gguf-model-data)
 endif()
 
 if (GGML_QNN)
+    # upstream b78a39a2f turned test-backend-ops into a build-only target and runs it from
+    # ci/run.sh instead. that drops it from ctest, and it is this backend's MUL_MAT correctness
+    # evidence, so a QNN build registers it again. guarded both ways: TARGET because a future
+    # upstream rename would otherwise fail the configure, NOT TEST so this is a no-op the day
+    # upstream registers it itself
+    if (TARGET test-backend-ops AND NOT TEST test-backend-ops)
+        llama_test(test-backend-ops LABEL main)
+    endif()
+
     # the HTP is single-client: the tests that can open the QNN device (any model load or
     # backend enumeration) must not overlap EACH OTHER under ctest -j. the test-qnn-* entries
     # need nothing from this block, they are RUN_SERIAL already and so exclude every other test
@@ -565,7 +574,7 @@ if (GGML_QNN)
         test-backend-ops test-thread-safety test-model-load-cancel test-autorelease
         test-save-load-state test-state-restore-fragmented test-backend-sampler
         test-opt test-gguf
-        test-list-devices-output test-llama-archs test-generate-models)
+        test-list-devices-output test-generate-models)
     foreach (_test IN LISTS _qnn_all_tests)
         if (_test MATCHES "^test-tokenizer-[01]-" OR _test MATCHES "^test-recurrent-state-rollback")
             list(APPEND _qnn_serial_tests ${_test})
