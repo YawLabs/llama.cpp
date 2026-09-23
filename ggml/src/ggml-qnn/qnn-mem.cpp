@@ -1,19 +1,15 @@
 #include "qnn-mem.h"
+#include "qnn-dl.h"
 
 #include "ggml-impl.h"
 
 #include <QnnMem.h>
 
+#include <cinttypes>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
-
-#ifdef _WIN32
-#    define WIN32_LEAN_AND_MEAN
-#    include <windows.h>
-#else
-#    include <dlfcn.h>
-#endif
 
 // fastrpc constants, normally from the Hexagon SDK rpcmem.h which the QNN SDK does not ship
 #define GGML_QNN_RPCMEM_HEAP_ID_SYSTEM 25
@@ -23,6 +19,11 @@ typedef void * (*rpcmem_alloc2_fn_t)(int heapid, uint32_t flags, size_t size);
 typedef void   (*rpcmem_free_fn_t)  (void * po);
 typedef int    (*rpcmem_to_fd_fn_t) (void * po);
 
+// resolved exactly once under ggml_qnn_rpcmem_once; every reader goes through
+// ggml_qnn_mem_available, so the pointers are never observed half-written
+static std::once_flag     ggml_qnn_rpcmem_once;
+static bool               ggml_qnn_rpcmem_ok = false;
+static bool               ggml_qnn_rpcmem_lib_loaded = false;
 static rpcmem_alloc2_fn_t rpcmem_alloc2 = nullptr;
 static rpcmem_free_fn_t   rpcmem_free   = nullptr;
 static rpcmem_to_fd_fn_t  rpcmem_to_fd  = nullptr;
@@ -74,53 +75,62 @@ static std::string ggml_qnn_fastrpc_dir(void) {
 }
 #endif
 
-static void * ggml_qnn_load_fastrpc(void) {
+// tried receives every path attempted with the reason it failed to load
+static void * ggml_qnn_load_fastrpc(std::string & tried) {
 #ifdef _WIN32
-    void * lib = (void *) LoadLibraryA("libcdsprpc.dll");
+    void * lib = ggml_qnn_dl_open("libcdsprpc.dll");
     if (!lib) {
+        tried = "the default search path (" + ggml_qnn_dl_error() + ")";
         std::string dir = ggml_qnn_fastrpc_dir();
         if (!dir.empty()) {
             std::string path = dir + "\\libcdsprpc.dll";
-            lib = (void *) LoadLibraryExA(path.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+            lib = ggml_qnn_dl_open(path.c_str());
+            if (!lib) {
+                const std::string why = ggml_qnn_dl_error();
+                tried += ", " + path + " (" + why + ")";
+            }
+        } else {
+            tried += "; the qcnspmcdm driver directory was not found";
         }
     }
     return lib;
 #else
-    return dlopen("libcdsprpc.so", RTLD_NOW | RTLD_LOCAL);
-#endif
-}
-
-static void * ggml_qnn_dl_sym(void * lib, const char * name) {
-#ifdef _WIN32
-    return (void *) GetProcAddress((HMODULE) lib, name);
-#else
-    return dlsym(lib, name);
-#endif
-}
-
-bool ggml_qnn_mem_available(void) {
-    static bool tried = false;
-    static bool ok    = false;
-    if (tried) {
-        return ok;
-    }
-    tried = true;
-
-    void * lib = ggml_qnn_load_fastrpc();
+    void * lib = ggml_qnn_dl_open("libcdsprpc.so");
     if (!lib) {
-        GGML_LOG_DEBUG("ggml-qnn: fastrpc (libcdsprpc) not found, shared memory unavailable\n");
-        return false;
+        tried = "the default search path (" + ggml_qnn_dl_error() + ")";
     }
+    return lib;
+#endif
+}
+
+static void ggml_qnn_rpcmem_load(void) {
+    std::string tried;
+    void * lib = ggml_qnn_load_fastrpc(tried);
+    if (!lib) {
+        // reached only when GGML_QNN_SHARED_MEM asks for shared memory, so INFO is not noise
+        GGML_LOG_INFO("ggml-qnn: fastrpc (libcdsprpc) could not be loaded, shared memory unavailable (tried %s)\n", tried.c_str());
+        return;
+    }
+    ggml_qnn_rpcmem_lib_loaded = true;
 
     rpcmem_alloc2 = (rpcmem_alloc2_fn_t) ggml_qnn_dl_sym(lib, "rpcmem_alloc2");
     rpcmem_free   = (rpcmem_free_fn_t)   ggml_qnn_dl_sym(lib, "rpcmem_free");
     rpcmem_to_fd  = (rpcmem_to_fd_fn_t)  ggml_qnn_dl_sym(lib, "rpcmem_to_fd");
 
-    ok = rpcmem_alloc2 && rpcmem_free && rpcmem_to_fd;
-    if (!ok) {
+    ggml_qnn_rpcmem_ok = rpcmem_alloc2 && rpcmem_free && rpcmem_to_fd;
+    if (!ggml_qnn_rpcmem_ok) {
         GGML_LOG_ERROR("ggml-qnn: fastrpc loaded but rpcmem symbols missing, shared memory unavailable\n");
     }
-    return ok;
+}
+
+bool ggml_qnn_mem_available(void) {
+    std::call_once(ggml_qnn_rpcmem_once, ggml_qnn_rpcmem_load);
+    return ggml_qnn_rpcmem_ok;
+}
+
+bool ggml_qnn_mem_lib_present(void) {
+    std::call_once(ggml_qnn_rpcmem_once, ggml_qnn_rpcmem_load);
+    return ggml_qnn_rpcmem_lib_loaded;
 }
 
 bool ggml_qnn_mem_alloc(const QNN_INTERFACE_VER_TYPE * iface, Qnn_ContextHandle_t context,
@@ -131,12 +141,12 @@ bool ggml_qnn_mem_alloc(const QNN_INTERFACE_VER_TYPE * iface, Qnn_ContextHandle_
 
     void * data = rpcmem_alloc2(GGML_QNN_RPCMEM_HEAP_ID_SYSTEM, GGML_QNN_RPCMEM_DEFAULT_FLAGS, size);
     if (!data) {
-        GGML_LOG_ERROR("ggml-qnn: rpcmem_alloc2 failed for %zu bytes\n", size);
+        GGML_LOG_DEBUG("ggml-qnn: rpcmem_alloc2 failed for %zu bytes\n", size);
         return false;
     }
     int fd = rpcmem_to_fd(data);
     if (fd < 0) {
-        GGML_LOG_ERROR("ggml-qnn: rpcmem_to_fd failed\n");
+        GGML_LOG_DEBUG("ggml-qnn: rpcmem_to_fd failed\n");
         rpcmem_free(data);
         return false;
     }
@@ -150,14 +160,14 @@ bool ggml_qnn_mem_alloc(const QNN_INTERFACE_VER_TYPE * iface, Qnn_ContextHandle_
     desc.ionInfo.fd          = fd;
 
     Qnn_MemHandle_t handle = nullptr;
-    if (iface->memRegister(context, &desc, 1, &handle) != QNN_SUCCESS || !handle) {
-        GGML_LOG_ERROR("ggml-qnn: QnnMem_register failed\n");
+    const Qnn_ErrorHandle_t err = iface->memRegister(context, &desc, 1, &handle);
+    if (err != QNN_SUCCESS || !handle) {
+        GGML_LOG_DEBUG("ggml-qnn: QnnMem_register failed for %zu bytes: %" PRIu64 "\n", size, (uint64_t) err);
         rpcmem_free(data);
         return false;
     }
 
     out->data   = data;
-    out->fd     = fd;
     out->size   = size;
     out->handle = handle;
     return true;

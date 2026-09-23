@@ -9,7 +9,6 @@
 
 struct ggml_qnn_mem_buffer {
     void *          data   = nullptr;
-    int             fd     = -1;
     size_t          size   = 0;
     Qnn_MemHandle_t handle = nullptr;
 };
@@ -17,7 +16,12 @@ struct ggml_qnn_mem_buffer {
 // load libcdsprpc and resolve the rpcmem entry points once, returns false if unavailable
 bool ggml_qnn_mem_available(void);
 
-// allocate an rpcmem buffer and register it with the QNN context
+// whether libcdsprpc itself loaded, even if ggml_qnn_mem_available is false because a symbol
+// is missing. tells "no fastrpc on this machine" apart from "fastrpc is here and broken"
+bool ggml_qnn_mem_lib_present(void);
+
+// allocate an rpcmem buffer and register it with the QNN context. a failure logs at DEBUG:
+// the caller falls back to host buffers and reports that once per session
 bool ggml_qnn_mem_alloc(const QNN_INTERFACE_VER_TYPE * iface, Qnn_ContextHandle_t context,
                         size_t size, ggml_qnn_mem_buffer * out);
 
