@@ -1,6 +1,6 @@
 # llama.cpp
 
-[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+[![Follow @YawLabs on X](https://img.shields.io/badge/follow-%40YawLabs-000000?logo=x&logoColor=white)](https://x.com/YawLabs)
 
 > [!NOTE]
 > **This is the YawLabs fork of [llama.cpp](https://github.com/ggml-org/llama.cpp).** It adds an
