@@ -20,13 +20,15 @@ Developed and measured on a Snapdragon X Elite (X1E80100, HTP v73).
 
 On that machine:
 
-- **No throughput figure is claimed.** The single-matmul kernel numbers this list used to
+- **No single-matmul kernel figure is claimed.** The kernel numbers this list used to
   lead with were taken in August 2026 without recording what else was running on the
   machine - the same flaw that later invalidated a round of model-run timings (see the
   retraction in the docs) - so they are withdrawn rather than repeated. The two mechanisms
   they were meant to show are real and still in the code: a DCVS TURBO power config, and
   baking a weight once into the HTP-native layout instead of re-tiling it on every
-  execute. What either is worth on an idle machine is an open question
+  execute. What either is worth on an idle machine is an open question. The one throughput
+  figure that is claimed is the end-to-end model run at the foot of this list, and it is a
+  loss
 - **47/47** `test-backend-ops` MUL_MAT correctness (F32/F16) against the CPU, run by ctest as
   `test-backend-ops-qnn`: 40 of 40 clean on an idle machine. A single 46/47 was seen once, in
   a run taken while other heavy work was loading the machine, and has not reproduced since on
@@ -58,15 +60,27 @@ On that machine:
   instead of letting it hang. See the docs for the tuning guidance
 - Composes with the other backends in one binary: KleidiAI CPU + Adreno GPU (OpenCL) + NPU
 
-What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end. The one 4B
-sweep has no valid NPU figure - its "NPU" leg never executed a matmul on the HTP, because
-the K-quant weights were repacked out of the NPU's reach and the one trial build stalled on
-the IO-size law (the docs carry the retraction) - and 9-14B models are unmeasured. Decode
-is not claimed for the NPU below 32-token ubatches, so it runs on the CPU; on the
-settled-pack run the two measured engines (GPU, CPU) and the CPU-run leg labelled NPU converge on decode. The case for fixing prefill
-with ahead-of-time compiled context binaries (a serialized context is reloaded instead of
-finalized again; the timings that sized that win have not been re-taken) is in
-[docs/backend/QNN.md](docs/backend/QNN.md).
+What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end - and that is
+now measured, not expected. The first NPU model run with proven placement (2026-09-26;
+`GGML_QNN_STATS` counters of 82 weights baked, 3936 executes, none slow, slowest 1 ms;
+Qwen3-4B-Q4_K_M, `-dev QNN -ub 32`, `GGML_QNN_NPAD=32`, the fp16-IO fix in place) put
+prefill at 44-53 t/s against the same binary's CPU path at 101-114 t/s with its own
+`-ub 512` and 74-80 t/s handicapped to the NPU's `-ub 32`: the eager NPU slice is a net
+loss of about 2.2x on a dense quantized 4B model, about 1.6x against the handicapped CPU,
+and lifting the weight budget (138 bake attempts against 82) changed nothing (49.2 against
+48.4 t/s). CPU prefill was noisy that day (19-27% relative stddev within a
+leg, so 74-114 is a range, not a point) and the verdict survives the worst pairing at
+1.9x; the docs give the per-leg table and the caveats. The earlier 4B sweep's "NPU" leg
+never executed a matmul on the HTP, because the K-quant weights were repacked out of the
+NPU's reach and the one trial build stalled on the IO-size law (the docs carry the
+retraction, which stays), and 9-14B models are unmeasured. Decode is not claimed for the
+NPU below 32-token ubatches, so it runs on the CPU in every configuration - the 2026-09-26
+counters show no decode execute on the HTP - and on the settled-pack run the two measured
+engines (GPU, CPU) and the CPU-run leg labelled NPU converge on decode; CPU decode on this
+box is bimodal (about 24.7 or about 15.9 t/s at `-t 6`), so no decode figure is quoted.
+The case for fixing prefill with ahead-of-time compiled context binaries (a serialized
+context is reloaded instead of finalized again; the timings that sized that win have not
+been re-taken) is in [docs/backend/QNN.md](docs/backend/QNN.md).
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 

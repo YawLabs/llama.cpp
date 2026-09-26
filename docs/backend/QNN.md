@@ -19,12 +19,14 @@ time and the QAIRT runtime DLLs (`QnnHtp.dll` and its dependencies) at run time,
 | `test-backend-ops` MUL_MAT (F32/F16 weights) | 47/47 pass via `ctest -R test-backend-ops-qnn`, 40 of 40 clean on an idle machine; one 46/47 was seen once under heavy machine load and has not reproduced on either IO path |
 | Single-matmul kernel throughput (burst clocks + static weights) | no figure claimed: the August 2026 numbers were taken without recording box load and have not been re-taken |
 | Real-model inference | completes, no hangs; unsupported shapes fall back to the CPU automatically |
-| End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | no valid NPU figure yet: the one 4B sweep's NPU leg never executed a matmul on the HTP (see the retraction under Measured comparison); unmeasured on 9-14B |
-| Decode (single-token) offload | intentionally not claimed below 32-token ubatches (`GGML_QNN_MIN_DIM`), so it runs on the CPU; on the settled-pack run the two measured engines (GPU, CPU) and the CPU-run leg labelled NPU converge on decode (see Measured comparison) |
+| End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | measured on 2026-09-26 with placement proven by the counters, Qwen3-4B-Q4_K_M prefill: the eager NPU slice is a net loss, 44-53 t/s against the same binary's CPU at 101-114 with its own `-ub 512` (~2.2x) and 74-80 at the NPU's forced `-ub 32` (~1.6x), with the fp16-IO fix in place and whether or not the weight budget is lifted; the GPU (228.1 on the settled-pack run) was not re-measured; unmeasured on 9-14B (see the 2026-09-26 subsection under Measured comparison; the earlier sweep's NPU leg never reached the HTP and that retraction stands) |
+| Decode (single-token) offload | intentionally not claimed below 32-token ubatches (`GGML_QNN_MIN_DIM`), so it runs on the CPU in every configuration - the 2026-09-26 counters show no decode execute on the HTP; every decode figure in this document is CPU decode, which is bimodal on this box (about 24.7 or about 15.9 t/s at `-t 6`) and is not quoted as a point; on the settled-pack run the two measured engines (GPU, CPU) and the CPU-run leg labelled NPU converge on decode (see Measured comparison) |
 
 The honest summary: the kernels are fast, the eager per-op execution model is robust,
-and per-op scheduling and IO copies are expected to eat the advantage on real models -
-expected, not yet measured end to end; see the retraction below. The practical value
+and per-op scheduling and IO copies eat the advantage on real models - expected from the
+start, and measured end to end on 2026-09-26 on one dense quantized 4B model with placement
+proven by the counters: the slice is a net loss there (see Measured comparison; the earlier
+sweep's retraction stays). The practical value
 today is (a) the robustness machinery (load-time shape prevalidation, persistent
 failed-shape denylist, watchdog with clean CPU fallback), (b) a working reload primitive
 showing that compile-once/load-fast AOT context binaries are the right next step (a
@@ -109,7 +111,7 @@ the two runs differed in workload context as well as in being separate runs.
 So quotability is per METRIC, not per run. Prefill at ~8% is defensible from one controlled
 run. Decode is not: quote a range or re-measure across three or more runs.
 
-**The GPU number reproduces; there is no NPU number to reproduce.** Three sweeps have now measured
+**The GPU number reproduces; as of this table there was no NPU number to reproduce** (the 2026-09-26 subsection below has the first, with placement proven). Three sweeps have now measured
 GPU pp512 - the superseded table at 227.4, this one at 228.1, and a third at 223.3 - agreeing
 within 2.1%, and the GPU is also the tightest leg within a run (+-0.49 on 226.9, 0.2%). The
 third sweep picked up foreign CPU load partway through and is not clean, which makes the GPU
@@ -124,7 +126,8 @@ superseded table's 101.5 is no help
 either, since that run's pack state was never recorded. And per the retraction, the table's
 NPU leg never reached the HTP, and the earlier NPU legs were not verified to reach it either -
 throughput cannot tell which engine ran - so "does the NPU number reproduce" is the wrong
-question until a `-dev QNN` sweep produces one.
+question until a `-dev QNN` sweep produces one. The 2026-09-26 sweep below is the first that
+did: its two lifted-budget legs agreed to 0.5%, its two default-budget legs, in separate runs, to 18%.
 
 These supersede an earlier table that had the CPU at 116.4 / 16.0 and the NPU at 101.5 / 15.8,
 and that claimed the GPU took decode by 25%. Two things changed. The GPU reproduced to +0.3%,
@@ -139,6 +142,106 @@ per the retraction - the shape of bandwidth-bound decode against compute-bound p
 earlier "the engine still matters for decode" reading is withdrawn. The NPU is not claimed
 for decode and so is not measured for it - that column says nothing about what the HTP would
 do, and per the retraction above neither does its prefill entry.
+
+### 2026-09-26: the first NPU run with proven placement
+
+Qwen3-4B-Q4_K_M again, on the `build-npu` tree (QNN + KleidiAI with `GGML_CPU_REPACK`, no
+OpenCL), QAIRT 2.45.0.260326, `llama-bench -t 6 -p 512 -n 64 -r 5` (`-n 64`, so tg64 here
+against tg128 above). `ggml-qnn.dll` and the other DLLs were built on 2026-09-23 at 07:43,
+after `e3ba3f695` - the fp16-IO fix, now the default - landed at 06:54; `llama-bench` itself
+reports `build_commit f0891308a` because the bench binary is from 06:48 that day and predates
+the commit. The `exec_max_ms 1` below, on fp16-weight graphs, is that fix at work: the
+mixed-dtype path it replaced took about 13 s per execute (see `test-qnn-health-control` under
+Testing). Four configurations, every leg the same binary and the same model:
+
+- A: NPU. `-dev QNN -ub 32`, `GGML_QNN_NPAD=32`, the default 1024 MB static-weight budget. The budget filled at 1012.5 MiB committed with 82 weights baked.
+- D: A with `GGML_QNN_STATIC_BUDGET_MB=0`. Lifting the budget did not put every weight on the NPU: the backend clamped it at 1830.0 MiB committed (`budget_clamped 1`, the build failure on an already-built shape that the budget bullet under How it behaves describes), 138 bakes were attempted (`weights_baked` and `graphs_created` both count attempts, before finalize); how many stayed resident is not directly counted, and the clamp implies at least one attempt failed. That is a higher ceiling than the ~1170 MiB seen on 2026-09-16 under load, on a machine with less running (see the noise paragraph below).
+- B: CPU. `GGML_QNN_DISABLE=1 -ub 32`, the ubatch the NPU configuration forces.
+- C: CPU. `GGML_QNN_DISABLE=1 -ub 512`, its own ubatch.
+
+The NPU-eligible weights at `GGML_QNN_NPAD=32` are the 144 attention projections (36 layers x
+`attn_q`, `attn_k`, `attn_v`, `attn_output`, all Q4_K or Q6_K); the 9728-wide FFN and the
+151936-wide tied output layer are over `GGML_QNN_IO_MAX_KB` and never leave the CPU. So A ran
+82 of 144 on the NPU and D attempted 138 of 144.
+
+Counterbalanced order A B C D D C B A, 120 s cooldowns, on AC, the pack at 100% for run 1;
+CPU load and charge recorded per leg; the driver is described under Benchmarking notes. Run 1
+lost AC during leg 7 (charge 100 -> 96% inside the leg), so leg 7 is excluded and leg 8 did
+not run; the missing B and A legs were re-taken in a second run four minutes later with the
+pack at 94-96% and charging, which is not a settled pack. Disk Cleanup (`cleanmgr`) was
+running in the background during run 1. `+-` is llama-bench's stddev over the five
+repetitions.
+
+| Leg | Config | pp512 t/s | tg64 t/s (CPU decode in every leg) | CPU during leg | Charge | `GGML_QNN_STATS` |
+|---|---|---:|---:|---:|---|---|
+| 1 | A: NPU, 1024 MB budget | 44.08 +- 6.39 | 18.61 +- 5.57 | 46.8% | 100 -> 100% | weights_baked 82, exec_count 3936, exec_slow 0, exec_max_ms 1 |
+| 2 | B: CPU `-ub 32` | 79.75 +- 21.83 | 24.79 +- 6.87 | 49.7% | 100 -> 100% | backend disabled |
+| 3 | C: CPU `-ub 512` | 100.97 +- 24.84 | 24.67 +- 7.03 | 47.8% | 100 -> 100% | backend disabled |
+| 4 | D: NPU, budget lifted | 49.09 +- 11.58 | 19.84 +- 6.68 | 42.1% | 100 -> 100% | weights_baked 138, exec_count 6528, exec_slow 0, exec_max_ms 1 |
+| 5 | D: NPU, budget lifted | 49.34 +- 10.50 | 19.95 +- 6.43 | 43.7% | 100 -> 100% | weights_baked 138, exec_count 6528, exec_slow 0, exec_max_ms 1 |
+| 6 | C: CPU `-ub 512` | 113.52 +- 22.06 | 15.80 +- 0.17 | 53.4% | 100 -> 100% | backend disabled |
+| 7 | B: CPU `-ub 32` | 91.52 +- 16.52, excluded | 15.88 +- 0.04, excluded | 54.1% | 100 -> 96%, AC lost | backend disabled |
+| run 2, 1 | B: CPU `-ub 32` | 73.72 +- 20.04 | 15.93 +- 0.38 | 59.1% | 95 -> 95%, charging | backend disabled |
+| run 2, 2 | A: NPU, 1024 MB budget | 52.74 +- 10.32 | 21.03 +- 6.28 | 50.7% | 96 -> 96%, charging | weights_baked 82, exec_count 3936, exec_slow 0, exec_max_ms 1 |
+
+Total CPU during each leg was 42-59%, where a `-t 6` workload on 12 cores predicts about 50%;
+idle CPU at each leg's gate was 3-11%.
+
+**1. The NPU executed on the HTP this time, and every execute was fast.** The proof the
+Benchmarking notes ask for is on record for every NPU leg: `weights_baked` 82 (A) and 138 (D),
+`exec_count` 3936 and 6528, `exec_slow` 0, `exec_max_ms` 1. The counters, not the throughput,
+say which engine ran. This is the figure this document has said did not exist.
+
+**2. Prefill: the eager NPU slice is a net loss on a dense quantized 4B model.** NPU 44-53 t/s
+(A pair 44.1 / 52.7, D pair 49.1 / 49.3) against CPU 101-114 at its own `-ub 512` and 74-80 at
+the NPU's forced `-ub 32`: ~2.2x slower than the CPU at the CPU's own ubatch (the C pair's mean
+107.2 against the four NPU legs' mean 48.8), ~1.6x slower even with the CPU handicapped to
+`-ub 32` (76.7 against 48.8). Lifting the weight budget - 138 bake attempts against 82, most
+of them resident - changes nothing (49.2 against 48.4). This is the outcome the Status section
+predicted from the start, per-op scheduling and IO copies eating the advantage, and it is now
+measured, with the fp16-IO fix in place, so the fix did not change the sign. The working
+verdict from August, reached before that fix on a larger dense quantized model - that the eager
+slice has negative value on dense quantized models - stands. One
+qualification on what was compared: configurations, not engines in isolation. Under `-dev QNN`
+every probe-accepted weight resolves to a plain CPU buffer (see Routing K-quant weights to the
+NPU), so the attention projections the budget left on the CPU - 62 in A, a handful in D - ran there
+without `CPU_REPACK`, while the CPU legs ran the full KleidiAI repack path. That follows from
+the placement rule and was not read from a load log today, and how much of the deficit it
+accounts for is unmeasured; A and D differ by some fifty such weights and by 0.8 t/s.
+
+**3. Decode is not an NPU measurement.** Every configuration ran decode on the CPU: the backend
+claims nothing below 32-token ubatches (`GGML_QNN_MIN_DIM`), and the counters agree.
+`exec_count` is a prefill-ubatch count with no decode term: 3936 and 6528 factor as 48 executes
+on each of 82 and 136 weights, or as the full 96 warmup-plus-repetition ubatches on half as many,
+and the counters do not say which (nor, on the first reading, why 48 rather than 96; this note
+does not guess). Either way, a decode step placed on the NPU would have added one execute per
+resident weight per token - 82 x 321 = 26322 over the tg64 test's warmup and five repetitions -
+and none appear. CPU
+decode is bimodal on this box, as recorded above: 24.7-24.8 in legs 2-3, 15.8-15.9 in legs 6-7
+and run 2, and the switch happened inside legs 1-5 and run 2's A leg, whose first repetitions
+ran at 24-30 t/s and last at 13-16 (leg 2: 30.2, 30.1, 28.9, 18.7, 16.0), while legs 6-7 and
+run 2's CPU leg sat at 15.6-16.4 for all five. The NPU-configured legs' decode (18.6-21.0,
++-5.6-6.7) straddles both modes. **CPU decode is deliberately not reported**, as above; the
+tg64 column is there so the modes can be seen, not as a figure.
+
+**4. Noise, stated plainly.** CPU prefill within-leg stddev was 20-25 t/s today, 19-27%
+relative, and the C pair spread 11.7%, against a CPU prefill pair spread of 1.6% and a noisiest
+leg at 5.5-7.4% relative on the 2026-08-27 settled run. So the CPU prefill is a 74-114 range
+here, not a point, and today's C legs (101.0, 113.5) sit 14-24% under that run's 132.2. The NPU
+D pair agreed to 0.5%, the A pair (in separate runs) to 18%, and the NPU legs ran 15-24%
+relative stddev within a leg. In every prefill leg the repetitions fall from the first to the
+last (leg 6: 135.5, 128.9, 122.0, 97.7, 83.5; leg 4: 69.3, 48.7, then a flat 42.5), so the
+stddev is mostly a drift within the leg, not scatter around a level; the clock was not sampled today, so the drift is
+recorded, not attributed. The first repetitions of the C legs (130.8, 135.5) sit at the settled
+run's 132.2; the leg means do not. The verdict survives the worst pairing - the CPU's slowest
+clean own-ubatch leg, 101.0, against the NPU's fastest, 52.7, is still 1.9x - and holds at both
+ends of the drift: first repetitions 130.8-135.5 against 54.9-69.8, last repetitions 77.4-83.5
+against 42.0-45.0. Run 2 was on a charging pack at 94-96%, not a settled one. Disk Cleanup ran
+in the background during run 1.
+
+**5. The GPU row was not re-measured.** The Adreno figures in the table above (228.1 / 20.0) are
+from the 2026-08-27 settled-pack run and stand as measured then; `build-npu` has no OpenCL, and
+no GPU leg ran today.
 
 ## Requirements
 
@@ -440,6 +543,26 @@ exists, with or without `GGML_QNN`, with a 60 s `TIMEOUT`.
 - The same holds for the NPU, and `llama-bench` hides the evidence: without `-v` it installs a null log callback, so every backend WARN and ERROR is dropped and a degraded NPU leg prints CPU numbers under the `QNN` backend name. The first degrade of a process is therefore also written straight to stderr: `ggml-qnn: NPU degraded (<reason>), claiming no ops for the rest of this process: everything runs on the CPU from here`.
   A leg that never claimed anything degrades nothing and prints nothing: weights left in `CPU_REPACK`, or the IO cap at a too-large `GGML_QNN_NPAD`. The first fixable IO-cap refusal of a process goes straight to stderr and names the `GGML_QNN_NPAD` and `-ub` that fit, so `llama-bench` shows it without `-v` as well (verified 2026-09-17: `-dev QNN` at the default `GGML_QNN_NPAD=512` prints it and leaves the whole model in `CPU_REPACK`).
   The proof that an NPU leg ran is `GGML_QNN_STATS`: `graphs_created` and `exec_count` must be non-zero, and `exec_max_ms` in the millisecond range.
+- The 2026-09-26 driver runs (the dated subsection under "Measured comparison") are the first
+  here with that proof on record, and they are repeatable from this description. One binary and
+  one model for every leg; `llama-bench -t 6 -p 512 -n 64 -r 5 -o jsonl`, only the result lines
+  parsed (the QnnHtp runtime prints its graph-prepare stages to stdout between them);
+  `QNN_SDK_ROOT`, `ADSP_LIBRARY_PATH` and the QAIRT `lib\aarch64-windows-msvc` directory on
+  `PATH` set once for all legs; per leg only `GGML_QNN_DISABLE`, `GGML_QNN_NPAD`,
+  `GGML_QNN_STATIC_BUDGET_MB` and `GGML_QNN_STATS`, cleared between legs. Counterbalanced order
+  A B C D D C B A with a 120 s cooldown between legs, so both NPU configurations are paired. A
+  gate before every leg (and at batch start and end) requires AC power, charge at or above 40%,
+  no other llama, genie or qnn process, and a 10 s `\Processor(_Total)\% Processor Time` window
+  averaging under 15%, retried up to six times, and logs the charge and idle CPU it saw. Through
+  each leg a 2 s sampler of the same counter runs and is averaged per leg; charge percent and AC
+  state are read again after the leg. Every NPU leg has `GGML_QNN_STATS` pointed at its own
+  file, so `weights_baked`, `exec_count`, `exec_slow` and `exec_max_ms` sit next to its timing,
+  and stderr is kept for the budget line. The driver script and the raw per-leg output (jsonl,
+  stats, stderr, driver log) are kept outside the repository. Two things this design did not
+  catch, both recorded after the fact: a mid-leg AC loss (leg 7, charge 100 -> 96% inside the
+  leg; the gate runs before a leg, not during, and the run ended before leg 8), and background
+  work that is not a llama, genie or qnn process (Disk Cleanup during run 1). Sample the clock
+  per tick as well; today's within-leg drift went unattributed for want of it.
 
 ## Known limitations
 
