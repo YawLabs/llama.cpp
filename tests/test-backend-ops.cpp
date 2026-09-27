@@ -12168,6 +12168,11 @@ int main(int argc, char ** argv) {
     output_printer->print_overall_summary(
         overall_summary_info(n_ok, ggml_backend_dev_count(), n_ok == ggml_backend_dev_count()));
 
+    // redirected stdout is buffered, and a backend DLL can end the process during teardown
+    // before the CRT flushes it (seen with the OpenCL backend on Windows ARM64), which loses
+    // the summary above
+    fflush(stdout);
+
     if (n_ok != ggml_backend_dev_count()) {
         return 1;
     }
