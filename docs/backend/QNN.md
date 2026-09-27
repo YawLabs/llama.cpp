@@ -16,22 +16,26 @@ time and the QAIRT runtime DLLs (`QnnHtp.dll` and its dependencies) at run time,
 
 | What | State |
 |---|---|
-| `test-backend-ops` MUL_MAT (F32/F16 weights) | 47/47 pass via `ctest -R test-backend-ops-qnn`, 40 of 40 clean on an idle machine; one 46/47 was seen once under heavy machine load and has not reproduced on either IO path |
+| `test-backend-ops` MUL_MAT (F32/F16 weights) | every count on record was taken on 47 cases, under the one 1 MiB IO cap that covered every graph until 2026-09-27: 47/47 pass via `ctest -R test-backend-ops-qnn`, 40 of 40 runs clean on an idle machine, and one 46/47 seen once under heavy machine load, which has not reproduced on either IO path. With the default cap for fp16 graph IO at 10 MiB the entry executes 49 cases by the arithmetic of the case list (the two F16-weight cases with 2.0 MiB of padded input join the 47, see Testing); no 49-case run is on record yet |
 | Single-matmul kernel throughput (burst clocks + static weights) | no figure claimed: the August 2026 numbers were taken without recording box load and have not been re-taken |
-| Real-model inference | completes, no hangs; unsupported shapes fall back to the CPU automatically; since 2026-09-27 K-quant weights also run at `-ub 512`, the fp16-IO graphs no longer being held under the 1 MiB IO cap |
-| Real-model accuracy vs the CPU | measured 2026-09-27 on Qwen3-4B-Q4_K_M (wikitext-2, 8 chunks of 512): the NPU path diverges from a CPU reference, mean KL divergence 0.047 +- 0.025, maximum 33.7, same top token 96.8-97.1%, where a CPU control without repack reads 0.000000. The cause is not identified, so the NPU path costs accuracy as well as speed (see the 2026-09-27 subsection under Measured comparison) |
-| End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | measured on 2026-09-26 with placement proven by the counters, Qwen3-4B-Q4_K_M prefill: the NPU configuration (`-dev QNN -ub 32`, `GGML_QNN_NPAD=32`) is a net loss, 44-53 t/s against the same binary's CPU at 101-114 with its own `-ub 512` (~2.2x) and 74-80 at the NPU's forced `-ub 32` (~1.6x), with the fp16-IO fix in place and whether or not the weight budget is lifted. That is a verdict on the configuration, not on the HTP alone: 41 (default budget) or 68 (budget lifted) of the 252 eligible projections ran on the NPU per context, the rest on the CPU without repack. The GPU (228.1 on the settled-pack run) was not re-measured; unmeasured on 9-14B (see the 2026-09-26 subsection under Measured comparison; the earlier sweep's NPU leg never reached the HTP and that retraction stands) |
+| Real-model inference | completes, no hangs; unsupported shapes fall back to the CPU automatically; since 2026-09-27 K-quant weights also run at `-ub 512`, the default cap on fp16 graph IO being 10 MiB where it was 1 MiB. The same default makes a QNN build offload model-scale weights without `-dev QNN` as well, wherever a weight sits in a plain host buffer; `GGML_QNN_DISABLE=1` or `GGML_QNN_IO_MAX_KB=1024` is the way back (see Routing K-quant weights to the NPU) |
+| Real-model output vs the CPU | measured 2026-09-27 on Qwen3-4B-Q4_K_M (wikitext-2, 8 chunks of 512, KL divergence against a CPU reference). The divergence first attributed to the NPU path was llama disabling flash attention under `-dev QNN`: with nothing on the NPU that configuration read mean 0.030, maximum 34.3, same top token 96.9%, to every digit what the CPU alone reads with `-fa off`. That is fixed (see Rebase notes), and the same run now reproduces the reference (mean 0.000000, same top token 100%). With weights on the NPU the output still differs from the CPU's (mean 0.015-0.047, maximum 20.3-34.9, same top token 96.5-97.3% over five placements), by about what the CPU's own two attention paths differ by. The mean and the maximum are set by a few unstable positions and do not rank configurations, so these runs do not show that the NPU path costs accuracy, and do not show that it equals the CPU (see the 2026-09-27 subsection under Measured comparison) |
+| End-to-end speed vs the Adreno GPU (OpenCL) or a KleidiAI CPU build | measured on 2026-09-26 with placement proven by the counters, Qwen3-4B-Q4_K_M prefill: the NPU configuration (`-dev QNN -ub 32`, `GGML_QNN_NPAD=32`) is a net loss, 44-53 t/s against the same binary's CPU at 101-114 with its own `-ub 512` (~2.2x) and 74-80 at the NPU's forced `-ub 32` (~1.6x), with the fp16-IO fix in place and whether or not the weight budget is lifted. That is a verdict on the configuration, not on the HTP alone: 41 (default budget) or 68 (budget lifted) of the 252 eligible projections ran on the NPU per context, the rest on the CPU without repack. The NPU legs also ran with flash attention disabled (llama disabled it under `-dev QNN`; that is read from the code path, `llama-bench` did not log it) and at `-ub 32`, the CPU legs with flash attention on. Neither holds for today's code, and a re-measurement with flash attention on and `-ub 512` has not been run yet. The GPU (228.1 on the settled-pack run) was not re-measured; unmeasured on 9-14B (see the 2026-09-26 subsection under Measured comparison; the earlier sweep's NPU leg never reached the HTP and that retraction stands) |
 | Decode (single-token) offload | intentionally not claimed below 32-token ubatches (`GGML_QNN_MIN_DIM`), so it runs on the CPU in every configuration - the 2026-09-26 counters show no decode execute on the HTP; every decode figure in this document is CPU decode, which is bimodal on this box (about 24.7 or about 15.9 t/s at `-t 6`) and is not quoted as a point; on the settled-pack run the two measured engines (GPU, CPU) and the CPU-run leg labelled NPU converge on decode (see Measured comparison) |
 
 The honest summary: the kernels are fast, the eager per-op execution model is robust,
 and per-op scheduling and IO copies were expected from the start to eat the advantage on
 real models. What 2026-09-26 measured end to end, on one dense quantized 4B model with
 placement proven by the counters, is the configuration: `-dev QNN` at `-ub 32` is a net loss
-there, and that run cannot say how much of the loss is the NPU slice and how much is the CPU
-running most of the projections without repack (see Measured comparison; the earlier
-sweep's retraction stays). 2026-09-27 added that the NPU path costs accuracy too: on the same
-model its output distribution diverges from the CPU's (mean KL divergence 0.047, the top
-token different at about 3% of positions) for a cause not yet identified. The practical value
+there, and that run cannot say how much of the loss is the NPU slice, how much is the CPU
+running most of the projections without repack, and how much is flash attention, which llama
+disabled in the NPU legs and not in the CPU legs (see Measured comparison; the earlier
+sweep's retraction stays). Since 2026-09-27 flash attention stays on under `-dev QNN` and
+K-quant weights run at `-ub 512`; the comparison has not been run again that way. 2026-09-27
+also measured the output against the CPU's. The divergence first attributed to the NPU path
+was the disabled flash attention; with that fixed, the output with weights on the NPU still
+differs from the CPU's, by about what the CPU's own two attention paths differ by, which
+neither shows a cost in accuracy nor shows the two equal. The practical value
 today is (a) the robustness machinery (load-time shape prevalidation, persistent
 failed-shape denylist, watchdog with clean CPU fallback), (b) a working reload primitive
 showing that compile-once/load-fast AOT context binaries are the right next step (a
@@ -80,7 +84,7 @@ weight against fp32 activations, which drops to a reference kernel on the HTP), 
 is slow enough to explain it alone: this shape is 671 M multiply-accumulates (2560 x 4096 x 64),
 and the same path took 13.1 s for the 84 M of `test-qnn-health` (512 x 2560 x 64), about 105 s
 at that rate against the 15 s watchdog. Which of the two caused the stall is not settled.
-Two gates were put in to keep it from recurring: `supports_op` refuses any source that sits in a non-host buffer (`CPU_REPACK` is one) before it builds anything, so the upgrade pass no longer trial-builds from repacked bytes, and `GGML_QNN_IO_MAX_KB` refuses a padded IO of 1 MiB before a graph is created. The first gate is the one that covers this shape today: its graph IO is fp16 now, and since 2026-09-27 the cap covers fp16 graph IO only when the variable is set (see the `GGML_QNN_IO_MAX_KB` row), because fp16 IO ran far past 1 MiB without a hang.
+Two gates were put in to keep it from recurring: `supports_op` refuses any source that sits in a non-host buffer (`CPU_REPACK` is one) before it builds anything, so the upgrade pass no longer trial-builds from repacked bytes, and `GGML_QNN_IO_MAX_KB` refuses a padded IO of 1 MiB before a graph is created. The first gate is the one that covers this shape today: its graph IO is fp16 now, 512 KiB of padded output at N=64, and since 2026-09-27 the default cap for fp16 graph IO is 10 MiB (see the `GGML_QNN_IO_MAX_KB` row), because fp16 IO ran up to 9.5 MiB without a hang.
 The numbers stay because they are what was measured; they do not measure the NPU.
 
 To put K-quant weights on the NPU, run with `-dev QNN`: llama-model-loader then probes
@@ -89,7 +93,7 @@ When this table was taken `llama-bench` had no way to turn repack off, so withou
 a K-quant model on a KleidiAI+REPACK build could not reach the NPU at all. Since the
 2026-09-27 upstream merge it has `--repack 0|1` (upstream `965f89794`), like `--no-repack` in
 `llama-cli` and `llama-server`; that route has not been run with the QNN backend. F16/F32
-weights stay in the plain CPU buffer and do reach the NPU. See "Routing K-quant weights to the NPU" for the caveats (`GGML_QNN_NPAD` must be set as well).
+weights stay in the plain CPU buffer and do reach the NPU. See "Routing K-quant weights to the NPU" for the caveats (since 2026-09-27 no `GGML_QNN_NPAD` is needed for an F16 or quantized weight under 10240 wide at the default `-ub 512`; a wider one, an F32 weight, any weight under `GGML_QNN_NO_F16_IO`, or any weight with `GGML_QNN_IO_MAX_KB` set still needs a `GGML_QNN_NPAD` and matching `-ub` that fit its width; when this table was taken every weight needed one).
 
 Read against that: the GPU takes prefill by 1.73x over the CPU leg and 1.95x over the
 "NPU" leg, and the "NPU" leg is 12% under the CPU leg - consistent with `-ub 64` on a CPU
@@ -175,8 +179,9 @@ The NPU-eligible weights at `GGML_QNN_NPAD=32` are all 252 projections of the 36
 (`attn_q`, `attn_k`, `attn_v`, `attn_output`, `ffn_up`, `ffn_gate` and `ffn_down`, all Q4_K or
 Q6_K). The IO cap counts 2 bytes per element for them, since their graph IO is fp16, so the
 9728-wide FFN is 9728 x 32 x 2 = 608 KiB, under the 1024 KiB cap; only the 151936-wide tied
-output layer is over `GGML_QNN_IO_MAX_KB` and never leaves the CPU (the cap then covered fp16
-graph IO by default; since 2026-09-27 it does so only when set). Which of them ran on the
+output layer is over `GGML_QNN_IO_MAX_KB` and never leaves the CPU (one default of 1024 KB
+then capped every graph; since 2026-09-27 the default for fp16 graph IO is 10240 KB, which
+that layer's 9.27 MiB at the 32 bucket passes). Which of them ran on the
 NPU follows from the bytes. Baked to fp16, `attn_q` and `attn_output` are 20 MiB each, `attn_k`
 and `attn_v` 5 MiB and each FFN projection 47.5 MiB, 192.5 MiB per layer, taken in graph order.
 A's first refusal at 1012.5 MiB is 5 x 192.5 + 50: layers 0-4 whole and layer 5's attention,
@@ -227,7 +232,9 @@ the NPU's forced `-ub 32`: ~2.2x slower than the CPU at the CPU's own ubatch (th
 107.2 against the four NPU legs' mean 48.8), ~1.6x slower even with the CPU handicapped to
 `-ub 32` (76.7 against 48.8). Lifting the weight budget - 68 weights on the NPU per context
 instead of 41 - changes nothing (49.2 against 48.4), and the fp16-IO fix was in place, so the
-fix did not change the sign. What this compares is configurations, not engines in isolation.
+fix did not change the sign. What this compares is configurations, not engines in isolation,
+and they differ in more than where the matmuls ran: in repack, in the ubatch, and in flash
+attention, which llama disabled in the NPU legs and not in the CPU legs (point 6).
 Under `-dev QNN` every probe-accepted weight resolves to a plain CPU buffer (see Routing
 K-quant weights to the NPU; the placement probe does not consult the budget), so the 211 (A)
 and 184 (D) projections the budget left on the CPU - about 85% and 74% of the projection
@@ -235,10 +242,12 @@ weights by size - ran there without `CPU_REPACK`, while the CPU legs ran with ev
 `CPU_REPACK`. That follows from the placement rule and was not read from a load log. D moved 27
 weights, 13 of them FFN, from the unrepacked CPU to the NPU and gained 0.8 t/s, inside the A
 pair's 18% spread, so the run cannot separate the NPU slice's own cost from the cost of losing
-repack, and the Status section's expected cause - per-op scheduling and IO copies - is not
+repack or of losing flash attention, and the Status section's expected cause - per-op
+scheduling and IO copies - is not
 established by it. The verdict is on the configuration, and on this 4B model: `-dev QNN` with
 the eager NPU slice, run as here, is slower than the CPU alone. The control that
-would separate the two causes, a leg with the same placement and no weight on the NPU, has not
+would separate the NPU slice from the rest, a leg with the same placement and no weight on
+the NPU, has not
 been run: `-dev QNN -ub 32` with `GGML_QNN_NPAD=32` and `GGML_QNN_STATIC_BUDGET_MB=1` keeps the
 placement and lets the budget refuse every bake (`GGML_QNN_NO_STATIC_WEIGHTS=1` would not: it
 makes quantized weights unclaimable, so they go back to `CPU_REPACK`), and since the upstream
@@ -280,64 +289,146 @@ in the background during run 1.
 from the 2026-08-27 settled-pack run and stand as measured then; `build-npu` has no OpenCL, and
 no GPU leg ran today.
 
-### 2026-09-27: fp16 graph IO past the cap, and what the NPU path costs in accuracy
+**6. Flash attention was not the same in every leg (found 2026-09-27).** Every leg asked for
+`llama-bench`'s default `-fa auto`: `flash_attn` is -1 in each leg's result lines. On the CPU
+legs that resolves to on. Under `-dev QNN` it resolved to off: layer 0 is assigned to the QNN
+device, the flash attention op runs on the CPU, and llama counted that as a device mismatch
+and disabled flash attention for the whole model. That is read from the code path
+(`resolve_fused_ops` in `src/llama-context.cpp`, present in the build of that day), not from
+a log of that day: `llama-bench` without `-v` drops the WARN that says so, which the
+2026-09-27 `llama-perplexity` logs of the same configuration carry. So the NPU legs ran
+without flash attention and the CPU legs with it, and the NPU legs ran at the `-ub 32` that
+the 1 MiB cap of the time forced, against the CPU's own `-ub 512` in C. How much of the 2.2x,
+or of the 1.6x against B, either accounts for is not known. The fork no longer disables flash
+attention there (see Rebase notes) and K-quant weights now run at `-ub 512`, so the verdict
+stands for the configuration that was measured and does not describe today's default one. A
+re-measurement with flash attention on and `-ub 512` has not been run yet. The one `-ub 512`
+figure on record, 58.2 t/s on 2026-09-27, is two repetitions with no interleaved CPU leg and
+with flash attention disabled.
 
-Qwen3-4B-Q4_K_M on the `build-npu` tree again (`llama-bench` reports `build_commit 820d1835b`),
-`-t 6` throughout. The raw logs and `GGML_QNN_STATS` files are kept outside the repository, in
-the bench records' `2026-09-27/npu-experiments` folder.
+### 2026-09-27: fp16 graph IO past 1 MiB, and the output against the CPU's
 
-**The IO cap is not needed on the fp16-IO path.** `test-qnn-lifecycle bigstatic`, one case per
-process, ran its five K=512 static bakes (M = 512, 640, 768, 1024 and 2560) at `GGML_QNN_NPAD`
-64, 256 and 512 with `GGML_QNN_IO_MAX_KB=1048576`: all 15 were claimed, computed and matched
-the CPU, finalize 16.1-32.2 ms, validation execute 2.6-3.2 ms. The largest, 512 x 2560 at the
-512 bucket, writes 2621440 bytes (2.5 MiB) by the graph's DDR summary, past the ~1 MiB that
-hung on the mixed-dtype path, and built in 25.7 ms with a 3.2 ms validation execute. A model
-run went further: `llama-bench -dev QNN -ub 512`, pp512 only and two repetitions, with
-`GGML_QNN_NPAD=512`, the cap lifted and `GGML_QNN_STATIC_BUDGET_MB=0` reported `weights_baked` 58, `exec_slow` 0 and
+Qwen3-4B-Q4_K_M on the `build-npu` tree again, `-t 6` throughout. `llama-bench` reports
+`build_commit 820d1835b` for its run; the `llama-perplexity` logs carry no build id, and the
+records' `README.txt` gives `5e4825195` as the tree of the runs it calls "before". These are
+correctness runs, not timings: other work was running on the
+machine during some of them. The raw logs, the `GGML_QNN_STATS` files, the saved reference
+logits, the two driver scripts (`npu-experiments.sh` and `kld-bisect.sh`) and a `README.txt`
+that lists every run are kept outside the repository, in the bench records'
+`2026-09-27/npu-experiments` folder.
+
+**fp16 graph IO ran without a hang up to 9.5 MiB of padded IO; larger is unmeasured.**
+`npu-experiments.sh io` ran `test-qnn-lifecycle bigstatic`, one case per process: its five
+K=512 static bakes (M = 512, 640, 768, 1024 and 2560) at `GGML_QNN_NPAD` 64, 256 and 512 with
+`GGML_QNN_IO_MAX_KB=1048576`. All 15 were claimed, computed and matched the CPU, finalize
+16.1-32.2 ms, validation execute 2.6-3.2 ms. The largest, 512 x 2560 at the 512 bucket,
+writes 2621440 bytes (2.5 MiB) by the graph's DDR summary, past the ~1 MiB that hung on the
+mixed-dtype path, and built in 25.7 ms with a 3.2 ms validation execute. A model run went
+further: `llama-bench -dev QNN -ub 512 -p 512 -n 0 -r 2` with `GGML_QNN_NPAD=512`, the cap
+lifted and `GGML_QNN_STATIC_BUDGET_MB=0` reported `weights_baked` 58, `exec_slow` 0 and
 `exec_max_ms` 18. That is 57 weights on the NPU - layers 0-7 whole, their 9728-wide FFN
-projections with 9.5 MiB of padded IO each included, and layer 8's `attn_q`, 1560.0 MiB by the
-byte arithmetic of the 2026-09-26 subsection - plus a 58th bake, a 2560 x 1024 projection
-whose finalize failed with 6020 and clamped the budget at 1560.0 MiB committed; `exec_count`
-171 is 57 x 3, one 512-token ubatch over the warmup and two repetitions. pp512 came back 58.2
-+- 11.8 t/s (66.5, 49.9); that is one run of two repetitions with no interleaved CPU leg, so
-it is not compared with the tables above. `llama-perplexity` at `-ub 512` with the same
-settings showed the same: `weights_baked` 58, the clamp at 1560.0 MiB, `exec_slow` 0,
-`exec_max_ms` 46. So on the fp16-IO path the cap only forced small ubatches, and it now covers
-fp16 graph IO only when `GGML_QNN_IO_MAX_KB` is set (see its row). The `-ub 32` perplexity run
-below clamped at 1762.5 MiB; why the 512 bucket clamps 202.5 MiB lower is not established.
+projections with 9.5 MiB of padded IO each included (9728 x 512 x 2), and layer 8's `attn_q`,
+1560.0 MiB by the byte arithmetic of the 2026-09-26 subsection - plus a 58th bake, a 2560 x
+1024 projection whose finalize failed with 6020 and clamped the budget at 1560.0 MiB
+committed; `exec_count` 171 is 57 x 3, one 512-token ubatch over the warmup and two
+repetitions. pp512 came back 58.2 +- 11.8 t/s (66.5, 49.9); that is one run of two
+repetitions with no interleaved CPU leg, and with flash attention disabled as in every
+`-dev QNN` run before the fix described below, so it is not compared with the tables above.
+`llama-perplexity` at `-ub 512` with the same settings showed the same: `weights_baked` 58,
+the clamp at 1560.0 MiB, `exec_slow` 0, `exec_max_ms` 46. So on the fp16-IO path the 1 MiB cap
+only forced small ubatches, and it no longer applies there: unset, `GGML_QNN_IO_MAX_KB` now
+caps fp16 graph IO at 10240 KB (see its row). That is a bound on what these runs measured,
+not a hang threshold. The 9.5 MiB of the 9728-wide FFN is the largest fp16 padded IO that has
+run, and it passes; the next size this model has, the 151936-wide output layer at the 512
+bucket (148.4 MiB), has never run and is refused. With the budget lifted the two `-ub 32`
+perplexity runs below clamped at 1762.5 and 1782.5 MiB, and the three `-ub 512` runs, this
+one and two perplexity runs, at 1560.0; why the 512 bucket clamps about 200 MiB lower is not
+established.
 
-**Accuracy: the NPU path diverges from the CPU.** `llama-perplexity` on the wikitext-2 test set,
-`-c 512`, 8 chunks, KL divergence against the saved logits of a CPU run at `-ub 32`:
+**The output against the CPU's: the first reading of these runs is withdrawn.**
+`llama-perplexity` on the wikitext-2 test set, `-c 512 -b 512 --chunks 8 -t 6`, KL divergence
+over the 2040 scored positions against the saved logits of one CPU reference run
+(`kld-base.bin`, log `kld-cpu.log`): `GGML_QNN_DISABLE=1`, `-ub 32`, default repack, and
+flash attention at its default `auto`, which resolves to on in a CPU run; PPL 15.1947 +-
+1.1852. The reference and the two "before, budget 0" rows are `npu-experiments.sh kld`. The
+rows with a tag are `kld-bisect.sh <tag> <ub> [GGML_QNN_*=value ...]`, which runs `-dev QNN`
+with `GGML_QNN_NPAD` set to `<ub>` and writes `bisect-<tag>.log` and
+`bisect-<tag>.stats.txt`. The two CPU rows were run by hand: no script holds their command
+lines, `README.txt` names the setting each differs from the reference by, and neither log
+has a `ggml-qnn` line or a QnnHtp graph-prepare line.
 
-| Run | Weights on the NPU | PPL | PPL(Q)/PPL(base) | Mean KLD | 99.9% KLD | Max KLD | Same top token |
-|---|---|---:|---:|---:|---:|---:|---:|
-| CPU reference | none | 15.1947 +- 1.1852 | - | - | - | - | - |
-| CPU `--no-repack`, control | none | 15.1947 +- 1.1852 | 1.016 +- 0.008 | 0.000000 | 0.000051 | 0.000064 | 100.0% |
-| NPU `-dev QNN -ub 32`, `GGML_QNN_NPAD=32`, budget 0 | 66 (`weights_baked` 67, `exec_count` 8448 = 66 x 128, `exec_slow` 0, `exec_max_ms` 4) | 15.0685 +- 1.1754 | 1.008 +- 0.015 | 0.047 +- 0.025 | 17.8 | 33.7 | 96.8 +- 0.4% |
-| NPU `-dev QNN -ub 512`, `GGML_QNN_NPAD=512`, cap lifted, budget 0 | 57 (`weights_baked` 58, `exec_count` 456 = 57 x 8, `exec_slow` 0, `exec_max_ms` 46) | 15.0964 +- 1.1797 | 1.010 +- 0.015 | 0.047 +- 0.025 | 17.9 | 34.5 | 97.1 +- 0.4% |
+"Before" is a build without the fork's change to `src/llama-context.cpp`, "after" is one with
+it (see Rebase notes). Every "before" `-dev QNN` log carries the two lines
+`resolve_fused_ops: layer 0 is assigned to device QNN but Flash Attention is assigned to device CPU (usually due to missing support)`
+and `resolve_fused_ops: Flash Attention not supported, set to disabled`; no "after" log does,
+and the reference and both CPU logs do not either.
 
-`weights_baked` counts bake attempts, so each NPU row's count includes the one bake whose
-finalize failed and clamped the budget (at 1762.5 and 1560.0 MiB committed); the executes
-confirm the placement, 128 ubatches of 32 tokens and 8 of 512 over the 8 chunks.
+| Run (log or tag) | Flash attention | `weights_baked` | Mean KLD | Median | 99% | 99.9% | Maximum | Same top token |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| CPU `--no-repack`, control (`kld-cpu-norepack.log`) | on | - | 0.000000 | 0.000000 | 0.000038 | 0.000051 | 0.000064 | 100.000% |
+| CPU `-fa off` (`kld-cpu-fa-off.log`) | off | - | 0.030161 | 0.001591 | 0.045214 | 0.288603 | 34.2501 | 96.912% |
+| before, budget 1 MB (`nobake`) | off | 0 | 0.030161 | 0.001591 | 0.045214 | 0.288603 | 34.2501 | 96.912% |
+| before, budget 193, `-ub 512` (`layer0`) | off | 7 | 0.030627 | 0.001742 | 0.063262 | 0.276353 | 34.6796 | 97.304% |
+| before, attention projections only, `-ub 32` (`attn-only`) | off | 17 | 0.030063 | 0.001585 | 0.044969 | 0.231028 | 34.2560 | 97.108% |
+| before, budget 0, `-ub 32` (`kld-npu.log`) | off | 67 | 0.046799 | 0.001801 | 0.050593 | 17.807894 | 33.6920 | 96.814% |
+| before, budget 0, `-ub 512`, cap lifted (`kld-npu512.log`) | off | 58 | 0.047382 | 0.001945 | 0.056312 | 17.861994 | 34.4967 | 97.108% |
+| after, budget 1 MB (`fa-nobake`) | on | 0 | 0.000000 | 0.000000 | 0.000038 | 0.000051 | 0.000064 | 100.000% |
+| after, budget 193, `-ub 512` (`fa-layers1`) | on | 7 | 0.030757 | 0.001638 | 0.049950 | 0.415830 | 34.8832 | 97.010% |
+| after, budget 580, `-ub 512` (`fa-layers3`) | on | 21 | 0.015188 | 0.001749 | 0.052855 | 0.437309 | 20.2611 | 97.108% |
+| after, budget 1160, `-ub 512` (`fa-layers6`) | on | 43 | 0.046687 | 0.001708 | 0.047936 | 18.014572 | 33.2914 | 96.520% |
+| after, budget 0, `-ub 512` (`fa-npu512`) | on | 58 | 0.045236 | 0.001849 | 0.062865 | 17.917280 | 33.9646 | 97.010% |
+| after, budget 0, `-ub 32` (`fa-npu32`) | on | 68 | 0.046422 | 0.001849 | 0.071601 | 17.564983 | 33.4883 | 97.304% |
 
-- The control reproduces the reference (mean KLD 0.000000, maximum 0.000064, the same top token
-  everywhere), so the CPU running the unbaked weights without repack, as it does in every
-  `-dev QNN` run, is not the source: the divergence is the NPU path's.
-- It is concentrated in a few positions: the median KLD is 0.0018-0.0019 and the 99th percentile
-  0.051-0.056, while the 99.9th is 17.8-17.9 and the maximum 33.7-34.5, and the top token
-  differs at about 3% of positions. The 32 and 512 buckets agree within noise, so the bucket
-  size does not change it.
-- The PPL ratio does not show it. The control reads 1.016 +- 0.008 against the same reference
-  with zero divergence - an offset from how `llama-perplexity` stores the reference, its
-  log-probabilities quantized to 16 bits per token (`tools/perplexity/perplexity.cpp`) - and the
-  NPU runs' own PPL (15.07, 15.10) sits well inside the CPU's 15.19 +- 1.19.
-- The cause is not identified. Candidates, none verified: the fp16 range on activations or
-  outputs (graph IO is fp16, so a value past 65504 cannot be represented), and fp16
-  accumulation inside the HTP matmul. The op-level MUL_MAT pass in the Status table compares
-  single matmuls at a tolerance, not a model's activations, and does not settle it either way.
+The budget is `GGML_QNN_STATIC_BUDGET_MB`. `weights_baked` counts bake attempts, so each of the
+four budget-0 rows includes the one bake that failed and clamped the budget, and 66, 57, 57
+and 67 weights ran on the NPU: `exec_count` is 8448 = 66 x 128, 456 = 57 x 8, 456 and 8576 =
+67 x 128, 128 ubatches of 32 tokens or 8 of 512 over the 8 chunks. The budgeted rows did not
+clamp (`budget_clamped` 0) and every baked weight executed: 56 = 7 x 8, 168 = 21 x 8, 344 =
+43 x 8, and 2176 = 17 x 128 for the attention projections. At 192.5 MiB a layer (the byte
+arithmetic of the 2026-09-26 subsection) the 7, 21 and 43 weights are layer 0, layers 0-2,
+and layers 0-5 with one 5 MiB projection that still fit. Both budget-1 rows report
+`weights_baked` 0 and `exec_count` 0. `exec_slow` is 0 in every row, and `exec_max_ms` 4-46
+where anything executed.
 
-So the NPU path costs accuracy as well as speed: on this model it is slower than the CPU
-(2026-09-26) and does not reproduce the CPU's output distribution.
+- Flash attention, not the NPU, made the first finding. `-dev QNN` with nothing baked reads
+  the same as the CPU alone with `-fa off`, to every digit of every column: llama had
+  disabled flash attention under `-dev QNN`, and the reference ran with it on. The first
+  reading of these runs set the two "before, budget 0" rows against the `--no-repack`
+  control, which ran with flash attention on, and called the difference the NPU path's. It
+  is withdrawn. With the change to `src/llama-context.cpp`, `-dev QNN` with nothing baked
+  reproduces the reference: the `fa-nobake` row equals the control.
+- The control still rules out repack. The CPU running weights without repack, as it does
+  under `-dev QNN` for every weight that is not baked, reproduces the reference (mean KLD
+  0.000000, maximum 0.000064, the same top token everywhere).
+- With weights on the NPU the output differs from the CPU's. The typical position differs
+  little, and by about what the CPU's own two attention paths differ by: in the five "after"
+  rows with weights on the NPU the median is 0.0016-0.0018, the 99th percentile 0.048-0.072
+  and the same top token 96.5-97.3%, against 0.0016, 0.045 and 96.9% for the CPU with
+  `-fa off`.
+- The mean and the maximum do not rank configurations here. They are set by a few positions
+  that flip completely (KLD 18-35), and they do not grow with the number of layers on the
+  NPU: one layer reads a maximum of 34.9 and a mean of 0.031, three layers 20.3 and 0.015,
+  six layers 33.3 and 0.047, the budget-0 placements 33.5-34.0 and 0.045-0.046. The CPU
+  alone with `-fa off` has such a position too (34.3). The 99.9th percentile is no steadier:
+  over 2040 positions `llama-perplexity` interpolates it between the fourth and the third
+  largest value, so it reads 0.23-0.44 where fewer than three positions flip and 17.6-18.0
+  where three or more do. This text has positions where the model's output is unstable under
+  any small numeric change, flash attention on against off on the CPU included.
+- The PPL ratio measures none of this. The control reads 1.016 +- 0.008 against the
+  reference with zero divergence. That offset comes from how `llama-perplexity` stores the
+  reference (`log_softmax` in `tools/perplexity/perplexity.cpp`): before it quantizes a
+  position's log-probabilities to 16 bits it floors them 16 nats below the top token's, so a
+  correct token less likely than that reads back with its NLL capped. That lowers PPL(base):
+  14.95 read back from the file, where the reference run itself reported 15.19, which is
+  33.3 nat over the 2040 positions. In `kld-base.bin` 9 of those positions have the correct
+  token on the floor. The 16-bit rounding cannot do it: one step is at most 16/65535 nat, so
+  rounding moves that sum by at most 0.25 nat. The PPL of every row (15.01-15.34) sits well
+  inside the reference's 15.19 +- 1.19.
+
+So these runs do not show that the NPU path costs accuracy, and they do not show that it
+equals the CPU. Not measured: a text without such positions, another model, any task-level
+quality. The op-level MUL_MAT pass in the Status table compares single matmuls at a
+tolerance, not a model's activations, and does not settle it either way.
 
 ## Requirements
 
@@ -382,6 +473,8 @@ llvm-mingw. Build with `-DGGML_CPU_KLEIDIAI=OFF` to skip the whole question.
 The backend composes with the other backends; a combined CPU (KleidiAI) + Adreno GPU
 (OpenCL) + NPU (QNN) binary works. With full GPU offload (`-ngl 99`) the QNN backend is
 idle by design; with partial offload it takes a bounded slice of the CPU-resident matmuls.
+It does the same in a run with no GPU and no `-dev QNN`, for every weight that sits in a
+plain host buffer, see "Routing K-quant weights to the NPU".
 
 ## How it behaves
 
@@ -396,9 +489,9 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   destination buffer (llama hangs a dummy one on the weight for exactly this). A
   quantized tensor probed with no buffer at all - a graph tensor, as in
   `test-backend-ops` - is refused, because nothing will tag it and the bake cannot happen.
-- Before any of that, `supports_op` does the checks that are arithmetic on the shape and need no session. A matmul whose padded IO would reach the IO cap, or overflow the 32-bit sizes QNN takes, is reported as not supported: it runs on the CPU and is never a failed op (a claimed node that the graph policy then refuses does not fall back, it fails the graph). The cap is `GGML_QNN_IO_MAX_KB` for every matmul graph when that is set; unset, its default 1024 covers only fp32 graph IO (an F32 weight, or any weight under `GGML_QNN_NO_F16_IO`), and an fp16-IO graph is limited by the 32-bit sizes alone.
-  A weight probed for placement at load has no real batch yet, so the smallest bucket (the `GGML_QNN_NPAD` floor) is used: a weight capped even there is not placed on the NPU, so on a KleidiAI build it keeps `CPU_REPACK` instead of landing in a plain CPU buffer it would never leave. At the default `GGML_QNN_NPAD=512` with the cap unset that is every F32 weight 512 or more wide; F16 and quantized weights, whose graph IO is fp16, are placed at any width. With `GGML_QNN_IO_MAX_KB=1024` set it is also every F16 or quantized weight 1024 or more wide, i.e. all of a model-scale model, which is how every run before 2026-09-27 behaved.
-  The first IO-cap refusal that a setting can fix is printed once per process, straight to stderr; it names the cap that refused it (a set `GGML_QNN_IO_MAX_KB`, or the default for fp32 graph IO) and the `GGML_QNN_NPAD` and `-ub` that fit that shape. A shape that fits only below `GGML_QNN_MIN_DIM` at a 1 MiB cap (a 151936-wide output layer; a 9728-wide FFN only with an F32 weight or under `GGML_QNN_NO_F16_IO`) can never run here at that cap, so it stays at DEBUG and does not use up that one notice; later refusals are DEBUG.
+- Before any of that, `supports_op` does the checks that are arithmetic on the shape and need no session. A matmul whose padded IO would reach the IO cap, or overflow the 32-bit sizes QNN takes, is reported as not supported: it runs on the CPU and is never a failed op (a claimed node that the graph policy then refuses does not fall back, it fails the graph). The cap is `GGML_QNN_IO_MAX_KB` for every matmul graph when that is set; unset, it is 1024 KB for fp32 graph IO (an F32 weight, or any weight under `GGML_QNN_NO_F16_IO`) and 10240 KB for the fp16 graph IO of an F16 or quantized weight.
+  A weight probed for placement at load has no real batch yet, so the smallest bucket (the `GGML_QNN_NPAD` floor) is used: a weight capped even there is not placed on the NPU, so on a KleidiAI build it keeps `CPU_REPACK` instead of landing in a plain CPU buffer it would never leave. At the default `GGML_QNN_NPAD=512` with the cap unset that is every F32 weight 512 or more wide and every F16 or quantized weight 10240 or more wide, the 151936-wide output layer among them; F16 and quantized weights under 10240 wide are placed. With `GGML_QNN_IO_MAX_KB=1024` set it is every F16 or quantized weight 1024 or more wide, i.e. all of a model-scale model, which is how every run before 2026-09-27 behaved.
+  The first IO-cap refusal that a setting can fix is printed once per process, straight to stderr; it names the cap that refused it (a set `GGML_QNN_IO_MAX_KB`, the default for fp16 graph IO, or the default for fp32 graph IO, with `GGML_QNN_NO_F16_IO` named when that is what selected it) and the `GGML_QNN_NPAD` and `-ub` that fit that shape. For the output layer of Qwen3-4B at the defaults it reads `ggml-qnn: a q6_K 2560x151936 matmul stays on the CPU: its padded IO is 148.4 MiB at N=512, at or over the 10.0 MiB cap (the GGML_QNN_IO_MAX_KB default for fp16 graph IO); GGML_QNN_NPAD=32 with -ub 32 (or lower) fits it. later IO-cap refusals are logged at DEBUG` (the line as the code prints it for that shape; no model run at the new default is on record). It reports what fits the cap and is not advice to change the bucket, see "Routing K-quant weights to the NPU". A shape that fits only below `GGML_QNN_MIN_DIM` (at a 1 MiB cap: a 151936-wide output layer; a 9728-wide FFN only with an F32 weight or under `GGML_QNN_NO_F16_IO`) can never run here at that cap, so it stays at DEBUG and does not use up that one notice; later refusals are DEBUG.
   A source in a non-host buffer is refused as well, see "Routing K-quant weights to the NPU". An exception inside the trial build (host out of memory) is an ERROR and the op is not claimed.
 - Model weights are baked into their graphs once (dequantized to fp16 when quantized) in
   HTP-native layout, within a memory budget (default 1024 MB, a conservative choice: in one run on a
@@ -421,12 +514,19 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
   resident weight, so `llama_init_from_model` is slower than steady state - expected, not
   a hang. The reserve graph has as many output rows as tokens (`n_outputs = min(n_ubatch,
   n_outputs_max)`), so it also bakes the weights that at compute time run only on the output
-  rows - the last layer's FFN after llama's output-row gather, and the output layer, which at
-  fp16 graph IO the default cap no longer refuses at any vocabulary (with a 1 MiB cap set, at
-  the 32 bucket, only a vocabulary under 16384 passes) - and
+  rows - the last layer's FFN after llama's output-row gather, and the output layer where the
+  IO cap passes it (at the fp16 default of 10 MiB a vocabulary under 10240 at the 512 bucket
+  and under 163840 at the 32 bucket, so Qwen3's 151936 passes at 32 and not at 512; with a
+  1 MiB cap set, at the 32 bucket, only a vocabulary under 16384) - and
   charges them against `GGML_QNN_STATIC_BUDGET_MB`. A normal prefill has one output row, below
   `GGML_QNN_MIN_DIM`, so those run on the CPU and their bakes only use up budget; that matters
-  only when the budget reaches that far (a small model, or the budget lifted). The bake cost is
+  only when the budget reaches that far (a small model, or the budget lifted). No output-layer
+  bake has run on the device: in every run on record the budget was full or clamped before
+  it, or the cap refused it. At 151936 x 2560 it is a 741.9 MiB bake, against 47.5 MiB for
+  the largest that has run. If it wedges the HTP, that costs one watchdog timeout (120 s for
+  the finalize, 15 s for the validation execute) and the session falls back to the CPU;
+  `GGML_QNN_IO_MAX_KB=1024` refuses it by arithmetic at the 32 bucket and every larger one.
+  The bake cost is
   re-paid per context, since the session and its baked weights are freed with the last
   backend instance. Only dynamic graphs (LoRA) are built on the first prompt
   that needs them. A matmul whose first operand is computed in the graph rather than a weight
@@ -438,9 +538,9 @@ idle by design; with partial offload it takes a bounded slice of the CPU-residen
 - Static-weight graphs pad the batch dimension to a bucket (default 512, `GGML_QNN_NPAD`),
   so one graph and one baked weight serve every N up to NPAD. Larger ubatches get one
   graph and one bake per power-of-two bucket, each charged to the budget, and a bucket
-  whose padded IO would reach the IO cap is refused (fp32 graph IO only, unless
-  `GGML_QNN_IO_MAX_KB` is set). A ubatch smaller than the floor still executes the whole
-  padded bucket. Dynamic graphs are bucket-padded the same way.
+  whose padded IO would reach the IO cap is refused (the default of the graph's IO element
+  size, or `GGML_QNN_IO_MAX_KB` when it is set). A ubatch smaller than the floor still
+  executes the whole padded bucket. Dynamic graphs are bucket-padded the same way.
 - Calls that can hang the HTP run under a watchdog; a timeout degrades the whole backend
   to a safe idle state and the model keeps running on the CPU/GPU. There are two limits:
   `GGML_QNN_BUILD_TIMEOUT_MS` (120 s) bounds graph finalize only, which is a compile, and
@@ -479,7 +579,11 @@ to a plain CPU buffer, bypassing repack, and the static bake sees the real bytes
 K-quant weights out of `CPU_REPACK`; neither has been run with the QNN backend. F16/F32 weights
 stay in the plain CPU buffer regardless and reach the NPU without it.
 
-Since 2026-09-27 `-dev QNN` is enough at the default `GGML_QNN_NPAD=512` for F16 and quantized weights: their graph IO is fp16, which the IO cap covers only when `GGML_QNN_IO_MAX_KB` is set, so the placement probe accepts them and llama's default `-ub 512` runs every baked weight at the 512 bucket (the 2026-09-27 subsection under Measured comparison ran that, with the cap lifted by hand before the default changed and the weight budget lifted). Keep `GGML_QNN_NPAD` at or under `-ub`: a smaller ubatch still executes the whole padded bucket. One side effect: the 151936-wide output layer is accepted at placement as well now, so under `-dev QNN` it too leaves `CPU_REPACK` for a plain CPU buffer, although it runs on the CPU whenever fewer than `GGML_QNN_MIN_DIM` rows are output (every single-sequence decode step and a normal prefill) and is baked only if the budget reaches it; what that costs the CPU is unmeasured. Before that change the probe refused every weight whose padded IO reached the 1 MiB cap at the smallest bucket, which at 512 is every F16 or quantized weight 1024 or more wide, so a model-scale model stayed in `CPU_REPACK` and nothing ran on the NPU; that is why every earlier run used `-ub 32` with `GGML_QNN_NPAD=32`, and it is still what happens with `GGML_QNN_IO_MAX_KB=1024` set. An F32 weight 512 or more wide, or any weight under `GGML_QNN_NO_F16_IO`, is refused the same way at the default. That first refusal is written straight to stderr rather than through the log callback - so it survives `llama-bench` without `-v`, but does not appear in a redirected log - and names the cap and the `GGML_QNN_NPAD` and `-ub` that fit the shape. For those, set both by weight width, see the `GGML_QNN_NPAD` row.
+Since 2026-09-27 `-dev QNN` is enough at the default `GGML_QNN_NPAD=512` for F16 and quantized weights under 10240 wide: their graph IO is fp16, which the default cap admits up to 10 MiB, so the placement probe accepts them and llama's default `-ub 512` runs every baked weight at the 512 bucket (the 2026-09-27 subsection under Measured comparison ran that, with the cap lifted by hand and the weight budget lifted). Keep `GGML_QNN_NPAD` at or under `-ub`: a smaller ubatch still executes the whole padded bucket. Before that change one default of 1 MiB capped every graph and the probe refused every weight whose padded IO reached it at the smallest bucket, which at 512 is every F16 or quantized weight 1024 or more wide, so a model-scale model stayed in `CPU_REPACK` and nothing ran on the NPU; that is why every earlier run used `-ub 32` with `GGML_QNN_NPAD=32`, and it is still what happens with `GGML_QNN_IO_MAX_KB=1024` set. At the default an F32 weight 512 or more wide, any weight that wide under `GGML_QNN_NO_F16_IO`, and an F16 or quantized weight 10240 or more wide (a 14336-wide FFN is one) are refused the same way. The first such refusal is written straight to stderr rather than through the log callback - so it survives `llama-bench` without `-v`, but does not appear in a redirected log - and names the cap and the `GGML_QNN_NPAD` and `-ub` that fit the shape. For those, set both by weight width, see the `GGML_QNN_NPAD` row.
+
+The output layer is the weight the 10 MiB default refuses on Qwen3-4B: 151936 wide, 148.4 MiB of padded output at the 512 bucket. At the defaults it keeps `CPU_REPACK`, as it did before 2026-09-27, and by the arithmetic the one stderr notice of a default run is about it and names `GGML_QNN_NPAD=32` with `-ub 32`. That line reports what fits the cap; it is not advice to change the bucket. At `GGML_QNN_NPAD=32` the layer's padded output is 151936 x 32 x 2 = 9.27 MiB, which the default passes, so under `-dev QNN` it leaves `CPU_REPACK` for a plain CPU buffer. It still runs on the CPU whenever fewer than `GGML_QNN_MIN_DIM` rows are output (every single-sequence decode step and a normal prefill), then without repack, and what that costs the CPU is unmeasured. It is baked only if the budget reaches it, and that bake, 741.9 MiB at fp16, has never run on the device (see the budget bullet under How it behaves). No single cap value admits the 9728-wide FFN at the 512 bucket (9.5 MiB) and refuses the output layer at the 32 bucket (9.27 MiB), so the default does not try: at `GGML_QNN_NPAD=32`, set `GGML_QNN_IO_MAX_KB=1024` to keep the output layer off the NPU path. That is the configuration of every run before 2026-09-27; it refuses the output layer and admits the FFN (608 KiB at 32).
+
+A QNN build offloads without `-dev QNN` too. llama creates the QNN backend in every context (it adds every ACCEL device, whatever `-dev` says), and the scheduler offers it every matmul whose weight sits in a plain host buffer, before the CPU: F16 and F32 weights on any build, and quantized weights wherever repack does not hold them - a build without `GGML_CPU_REPACK`, `--no-repack`, `llama-bench --repack 0`. `-dev QNN` only adds the quantized weights that repack would otherwise take. Until 2026-09-27 the 1 MiB default refused every F16 or quantized weight 1024 or more wide at the default 512 bucket, so at the defaults such a run put nothing of model scale on the NPU. With the default for fp16 graph IO at 10 MiB it does: F16 and quantized weights under 10240 wide are baked, up to the weight budget, and their matmuls run on the NPU at ubatches of `GGML_QNN_MIN_DIM` or more. This follows from the code; no run without `-dev QNN` has been measured since the default changed. The way back is `GGML_QNN_DISABLE=1`, which turns the backend off, or `GGML_QNN_IO_MAX_KB=1024`, which restores the refusal of before 2026-09-27.
 
 Measured on 2026-09-16 (Qwen3-4B-Q4_K_M, `-t 6 -p 32 -ub 32 -dev QNN`, `GGML_QNN_NPAD=32`,
 QAIRT 2.45.0.260326). Placement works: with the watchdog limits raised by hand (to repeat this on a device that slow, raise `GGML_QNN_TIMEOUT_MS` past the slowest execute and set `GGML_QNN_SLOW_EXEC_MS=0` as well; with the timeout alone the completed validation is refused as too slow), 81 static graphs
@@ -519,14 +623,14 @@ anticipated.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `GGML_QNN_DISABLE` | unset | disable the backend entirely |
+| `GGML_QNN_DISABLE` | unset | disable the backend entirely. It is how a QNN build stays on the CPU: the backend is otherwise created in every context and claims matmuls with or without `-dev QNN` (see Routing K-quant weights to the NPU) |
 | `GGML_QNN_MIN_DIM` | 32 | minimum matmul dimension to claim (smaller goes to the CPU) |
 | `GGML_QNN_STATIC_BUDGET_MB` | 1024 | cap on baked static-weight bytes (a quantized weight is charged at its fp16 on-device size), 0 = unlimited. 1024 as a conservative margin: weight mapping failed at about 1170 MiB committed in one run on a machine loaded with other work, and at 1830.0 MiB on a near-idle one with the budget lifted (2026-09-26); a build failure on a shape that already built in the session clamps the budget to the committed bytes for the rest of the session, and the first clamp of a process is written straight to stderr with its phase and error code. Weights that run only on the output rows are baked and charged at reserve as well, see the budget bullet under How it behaves |
-| `GGML_QNN_NPAD` | 512 | batch-dim bucket floor for static and dynamic graphs: one graph serves every N up to it, and a ubatch below it still executes the whole padded bucket, so keep it at or under `-ub` (the defaults, 512 and 512, match). The padded IO is `NPAD * max(K, M) * e` bytes, where e = 2 for F16 and quantized weights (their graph IO is fp16) and 4 for F32 weights or under `GGML_QNN_NO_F16_IO`. Where the IO cap applies (see `GGML_QNN_IO_MAX_KB`: e = 4 by default, every graph when set) the padded IO must stay UNDER it (equal is refused), with a matching `-ub`, so a too-large NPAD costs offload rather than a watchdog stall. At a 1 MiB cap and e = 4: 64 for a 2560-wide weight, 32 for 4096-wide projections such as Qwen3-4B attention, 16 for the 9728-wide Qwen3-4B FFN and 1 for the 151936-wide output layer, the last two below the default `GGML_QNN_MIN_DIM`, so those stay on the CPU; at the default 512 every weight 512 or more wide is refused, at placement too. With `GGML_QNN_IO_MAX_KB=1024` set, e = 2 is capped too, at 128 for a 2560-wide weight (anything under 4096 wide), 64 for 4096-wide projections, where 128 lands exactly on 1 MiB, 32 for the FFN and 3 for the output layer, and at 512 every weight 1024 or more wide is refused. The first refusal of a process goes straight to stderr, not through the log callback, and names the cap and the `GGML_QNN_NPAD` and `-ub` that fit that shape. Where the cap comes from: graph execute hung when a padded IO buffer crossed a runtime-dependent threshold (~1-1.5 MB measured; exactly 1 MiB hung on QAIRT 2.45), and every one of those measurements ran on the mixed-dtype path that `e3ba3f695` replaced. fp16 graph IO does not follow it: on 2026-09-27, with the cap lifted, K=512 static bakes up to 2.5 MiB of padded output passed at NPAD 64, 256 and 512, and Qwen3-4B at `-ub 512` ran 57 weights on the NPU, the 9728-wide FFN with 9.5 MiB of padded IO among them, with no slow execute (see the 2026-09-27 subsection under Measured comparison). No measurement here covers an F32 weight past 1 MiB, so fp32 graph IO keeps the cap |
-| `GGML_QNN_IO_MAX_KB` | unset (1024 for fp32 graph IO) | policy-reject a matmul whose padded input or output would reach this many KB (strict less-than passes); the shape runs on the CPU instead of hanging the HTP, and as a policy reject it is not denylisted. Set, it caps every matmul graph. Unset (or not a valid number, which WARNs), the default of 1024 caps only graphs whose IO is 4 bytes per element, an F32 weight or any weight under `GGML_QNN_NO_F16_IO`, the mixed-dtype path where the hang was measured; an F16 or quantized weight's fp16 graph IO is then limited only by the 32-bit sizes QNN takes, because it ran far past 1 MiB without a hang (2026-09-27, see `GGML_QNN_NPAD`) and the cap there only forced small ubatches. Before 2026-09-27 the default capped fp16 graph IO too; `GGML_QNN_IO_MAX_KB=1024` restores that. `supports_op` applies the cap before it claims, so such a matmul is "not supported", never a failed op, and a weight capped at the smallest bucket is not placed on the NPU at load. The padded IO counts 2 bytes per element for F16 and quantized weights and 4 for F32 weights or under `GGML_QNN_NO_F16_IO`, see `GGML_QNN_NPAD` |
+| `GGML_QNN_NPAD` | 512 | batch-dim bucket floor for static and dynamic graphs: one graph serves every N up to it, and a ubatch below it still executes the whole padded bucket, so keep it at or under `-ub` (the defaults, 512 and 512, match). The padded IO is `NPAD * max(K, M) * e` bytes, where e = 2 for F16 and quantized weights (their graph IO is fp16) and 4 for F32 weights or under `GGML_QNN_NO_F16_IO`. It must stay UNDER the IO cap (equal is refused; see `GGML_QNN_IO_MAX_KB`: unset, 1024 KB at e = 4 and 10240 KB at e = 2; set, that value for every graph), with a matching `-ub`, so a too-large NPAD costs offload rather than a watchdog stall. With the cap unset and e = 2 the largest NPAD that fits is 512 for any weight under 10240 wide (the 9728-wide Qwen3-4B FFN is 9.5 MiB there), 256 for a 14336-wide FFN and 32 for the 151936-wide output layer, which at 512 is 148.4 MiB and refused, at placement too. With the cap unset and e = 4 it is 64 for a 2560-wide weight, 32 for 4096-wide projections such as Qwen3-4B attention, 16 for the 9728-wide Qwen3-4B FFN and 1 for the 151936-wide output layer, the last two below the default `GGML_QNN_MIN_DIM`, so those stay on the CPU; at the default NPAD of 512 every such weight 512 or more wide is refused, at placement too. With `GGML_QNN_IO_MAX_KB=1024` set, e = 2 is capped at 1 MiB too, at 128 for a 2560-wide weight (anything under 4096 wide), 64 for 4096-wide projections, where 128 lands exactly on 1 MiB, 32 for the FFN and 3 for the output layer, and at 512 every weight 1024 or more wide is refused. The first refusal of a process that a setting can fix goes straight to stderr, not through the log callback, and names the cap and the `GGML_QNN_NPAD` and `-ub` that fit that shape. Where the cap comes from: graph execute hung when a padded IO buffer crossed a runtime-dependent threshold (~1-1.5 MB measured; exactly 1 MiB hung on QAIRT 2.45), and every one of those measurements ran on the mixed-dtype path that `e3ba3f695` replaced. fp16 graph IO ran past that size: on 2026-09-27, with the cap lifted, K=512 static bakes up to 2.5 MiB of padded output passed at NPAD 64, 256 and 512, and Qwen3-4B at `-ub 512` ran 57 weights on the NPU, the 9728-wide FFN with 9.5 MiB of padded IO among them, with no slow execute (see the 2026-09-27 subsection under Measured comparison). 9.5 MiB is the largest fp16 padded IO that has run, which is why the fp16 default is 10 MiB and no higher. No measurement here covers an F32 weight past 1 MiB, so fp32 graph IO keeps the 1 MiB default |
+| `GGML_QNN_IO_MAX_KB` | unset (1024 for fp32 graph IO, 10240 for fp16 graph IO) | policy-reject a matmul whose padded input or output would reach this many KB (strict less-than passes); the shape runs on the CPU instead of hanging the HTP, and as a policy reject it is not denylisted. Set, it caps every matmul graph at that value. Unset, there is one default per IO element size. 1024 for the graphs whose IO is 4 bytes per element, an F32 weight or any weight under `GGML_QNN_NO_F16_IO`: the mixed-dtype path where the hang was measured, and the F32 weight that nothing has measured past 1 MiB. 10240 (10 MiB) for the fp16 graph IO of an F16 or quantized weight: a bound on what was measured, not a hang threshold. The largest fp16 padded IO that has run is 9.5 MiB (9728 x 512 x 2, the FFN of Qwen3-4B at the 512 bucket, 2026-09-27, see `GGML_QNN_NPAD`) and passes; nothing larger has run, and the 151936-wide output layer at the 512 bucket, 148.4 MiB, is refused. At the 32 bucket that layer is 9.27 MiB and passes, see "Routing K-quant weights to the NPU". Before 2026-09-27 one default of 1024 capped every graph, which `GGML_QNN_IO_MAX_KB=1024` restores; a value over 10240 admits fp16 IO of a size that has never run on the device. A value that is not a whole number of 1 or more counts as unset, and because unset is two numbers and not the one a set value is, the backend says so once on stderr instead of in the log: `ggml-qnn: GGML_QNN_IO_MAX_KB="12k" is not a whole number of KB, 1 or more: it counts as unset, so the defaults apply (fp32 graph IO capped at 1024 KB, fp16 graph IO at 10240 KB)`. Whitespace after the number is not part of the value (`set GGML_QNN_IO_MAX_KB=1024 && prog` in cmd.exe leaves a space there), and a value over 4194304 (4 GiB) acts as 4194304, since the 32-bit sizes QNN takes refuse IO of 4 GiB and more before the cap is asked. `supports_op` applies the cap before it claims, so such a matmul is "not supported", never a failed op, and a weight capped at the smallest bucket is not placed on the NPU at load. The padded IO counts 2 bytes per element for F16 and quantized weights and 4 for F32 weights or under `GGML_QNN_NO_F16_IO`, see `GGML_QNN_NPAD` |
 | `GGML_QNN_NO_OPT` | unset | drop the finalize-optimization flag (matmul graphs; debugging lever); also bypasses denylist entries loaded from the file |
 | `GGML_QNN_NO_STATIC_WEIGHTS` | unset | disable static weight baking |
-| `GGML_QNN_NO_F16_IO` | unset | restore the old mixed-dtype matmul graphs (fp16 weight, fp32 activation and output), which drop to a reference kernel on the HTP: 418x slower on one shape measured on 2026-09-23 (208.9 ms against 0.5 ms), and 13099 ms instead of 0 ms for `test-qnn-health`. Only for reproducing that; it also makes the IO cap count 4 bytes per element for every weight, which puts every weight under the default cap (see `GGML_QNN_IO_MAX_KB`), and drops the `_io16` tag from shape keys. `test-qnn-health-control` sets it |
+| `GGML_QNN_NO_F16_IO` | unset | restore the old mixed-dtype matmul graphs (fp16 weight, fp32 activation and output), which drop to a reference kernel on the HTP: 418x slower on one shape measured on 2026-09-23 (208.9 ms against 0.5 ms), and 13099 ms instead of 0 ms for `test-qnn-health`. Only for reproducing that; it also makes the IO cap count 4 bytes per element for every weight, which gives every weight the 1024 KB default of fp32 graph IO (see `GGML_QNN_IO_MAX_KB`), and drops the `_io16` tag from shape keys. `test-qnn-health-control` sets it |
 | `GGML_QNN_HTP_ARCH` | queried | the HTP arch the device is created for (68, 69, 73, 75, 79, 81, 85, 89), overriding the one queried from the device; 0 creates the device with no arch config, as builds before `e3ba3f695` did. The INFO line `ggml-qnn: HTP arch v73, SoC model 0` names what was used, and an arch that is still unknown gets a WARN. Setting the arch had no measured effect on speed |
 | `GGML_QNN_SOC_MODEL` | queried | the SoC model added to the device config (60 = X Elite, the value Genie uses). The X Elite here reports the UNKNOWN sentinel, which is not forwarded, so without this variable its device is created with the arch alone (`SoC model 0` in the INFO line) |
 | `GGML_QNN_DENYLIST` | unset | file that persists HTP verdicts on shapes across runs: finalize errors and watchdog timeouts, with the exceptions in the denylist bullet under "How it behaves". Every other failure is remembered for the process only. It starts with the header line `# ggml-qnn denylist v1`. Nothing removes an entry: delete the file, or the entry, once `test-qnn-health` passes with nothing else running, if a run on a slow or busy machine wrote to it |
@@ -550,7 +654,12 @@ anticipated.
 | `GGML_QNN_FAIL_FINALIZE_SKIP` | 0 | test-only: the first n matching graphs finalize normally; every match after them fails |
 | `GGML_QNN_FAIL_INIT` | unset | test-only fault hook: with `GGML_QNN_FAIL_INIT=<n>` the first n session inits of the process run and the next one fails before `QnnHtp` is loaded (one-shot), so a re-init that fails after a working session can be reached on a healthy device (`test-qnn-reinit-fail`). Never set outside the test suite |
 
-A value that fails to parse falls back to the default with a WARN in the log. On Windows an
+A value that is not a number, or is below the variable's minimum, falls back to the default
+with a WARN in the log that names the default:
+`ggml-qnn: <VAR>="<value>" is not a number, using the default <N>` or
+`ggml-qnn: <VAR>=<value> is below the minimum <M>, using the default <N>`.
+Whitespace after the number is not part of the value. `GGML_QNN_IO_MAX_KB` reports an unusable
+value on stderr instead, because its default is two numbers (see its row). On Windows an
 unset `ADSP_LIBRARY_PATH` is reported at WARN, which `llama-cli` and `llama-server` show at the default verbosity, since on QAIRT 2.45 and newer the first
 execute dies silently without it.
 
@@ -571,12 +680,16 @@ or mode variant each; the header comment of that file describes every mode:
   `test-qnn-denylist-noopt`, `test-qnn-denylist-probe`, `test-qnn-watchdog`, `test-qnn-fault`,
   `test-qnn-clamp`, `test-qnn-clamp-unlimited`, `test-qnn-health`, `test-qnn-health-control`
 - op-level correctness against the CPU: `test-backend-ops-qnn`, which runs `test-backend-ops -b QNN
-  -o MUL_MAT` with `GGML_QNN_NPAD=32` and `GGML_QNN_MIN_DIM=1` and fails if it executed zero cases
+  -o MUL_MAT` with `GGML_QNN_NPAD=32`, `GGML_QNN_MIN_DIM=1` and `GGML_QNN_IO_MAX_KB` unset, and
+  fails if it executed zero cases
 - model-scale bakes and their env variants: `test-qnn-modelscale`,
   `test-qnn-modelscale-npad0`, `test-qnn-noopt`, `test-qnn-modelscale-nostatic`,
   `test-qnn-modelscale-noburst`, `test-qnn-modelscale-shm`
 - configuration surface: `test-qnn-disable`, `test-qnn-mindim`, `test-qnn-rebake`,
-  `test-qnn-elementwise`, `test-qnn-elementwise-on`, `test-qnn-loadprobe`, `test-qnn-envparse`
+  `test-qnn-elementwise`, `test-qnn-elementwise-on`, `test-qnn-loadprobe`, `test-qnn-envparse`.
+  `test-qnn-mindim` pins the two IO cap defaults, the fp16 one by placement probes that bake
+  nothing: an F16 weight 10239 wide is placed and one 10240 wide refused, the 9728-wide Q4_K
+  FFN is placed and the 151936-wide Q6_K output layer refused
 - sessions and weight paths: `test-qnn-reuse`, `test-qnn-dyncache`, `test-qnn-quantized`
 - the test-only hooks `GGML_QNN_DELAY_EXECUTE`, `GGML_QNN_FAIL_FINALIZE`, `GGML_QNN_FAIL_EXECUTE`
   (at compute time, under `GGML_QNN_NO_PREVALIDATE`) and `GGML_QNN_FAIL_INIT`, on small F32
@@ -613,17 +726,26 @@ the watchdog, fault, hook, reuse, dyncache, quantized and envparse entries, 600 
 rest. Exit code 77 means no HTP or an HTP init failure; ctest reports it as
 NOT RUN, not FAILED, so check the `ggml-qnn` INFO line in the output to tell the two apart.
 On a box known to have an HTP, configure with `-DLLAMA_QNN_TEST_REQUIRE_HTP=ON` (default
-OFF), which sets `GGML_QNN_TEST_REQUIRE_HTP=1` on every `test-qnn-*` entry, or export that
-variable for a single run: the skip becomes a failure (exit 1), so a device or context that failed to create cannot turn the whole suite into skips while ctest still exits 0.
+OFF), which sets `GGML_QNN_TEST_REQUIRE_HTP=1` on every `test-qnn-*` entry and on
+`test-backend-ops-qnn` (the option's help text: `llama: fail the test-qnn-* entries and test-backend-ops-qnn when no HTP is found`), or export that variable for a single run: the skip becomes a failure (exit 1), so a device or context that failed to create cannot turn the whole suite into skips while ctest still exits 0. An existing build directory has to be configured again with the option for the entries to get the variable. Without it `test-backend-ops-qnn` on a box with no usable HTP prints `no usable HTP, skipping` and ctest reports it Passed, not NOT RUN.
 `test-qnn-modelscale-shm` also exits 77 when the fastrpc library is absent (`shm_selftest 0` in its stats file); a library that is present with a failed self-test (`shm_selftest 1`) fails the entry.
 `test-backend-ops -b QNN -o MUL_MAT` is the figure in the Status table, but ONLY with
 `GGML_QNN_NPAD=32` and `GGML_QNN_MIN_DIM=1` set. At the defaults `supports_op` declined every
-one of the ~1680 test shapes - measured 2026-09-22: zero executed at the defaults, 2 with
-`GGML_QNN_NPAD=32` alone and 47 with `GGML_QNN_MIN_DIM=1` as well, so `GGML_QNN_MIN_DIM`
-declines most of them and the IO cap at the 512 bucket (which then covered fp16 graph IO too)
-the rest - and the binary then prints `Backend QNN: OK` having compared nothing. The ctest entry
-`test-backend-ops-qnn` pins those settings and fails if the executed count is zero, so a green
-run means something; a bare manual invocation at the defaults does not.
+one of the ~1680 test shapes - measured 2026-09-22, when one 1 MiB cap covered every graph:
+zero executed at the defaults, 2 with `GGML_QNN_NPAD=32` alone and 47 with
+`GGML_QNN_MIN_DIM=1` as well, so `GGML_QNN_MIN_DIM` declined most of them - and the binary
+then prints `Backend QNN: OK` having compared nothing. The defaults have not been measured
+again since the cap default changed. The ctest entry `test-backend-ops-qnn` pins those two
+settings, unsets `GGML_QNN_IO_MAX_KB` (a value exported by the caller's shell caps every graph
+and changes the count) and fails if the executed count is zero, so a green run means
+something; a bare manual invocation at the defaults does not.
+With the cap unset the pinned run executes 49 cases, not 47, by the arithmetic of the case
+list: the two F16-weight `m = 1` cases of 512 and 509 columns (`k` 2048 and 2051) pad to the
+512 bucket, 2.0 MiB of padded input, which the 1 MiB cap refused and the 10 MiB default
+passes. No 49-case run is on record yet; every count in the Status table is on 47 cases. The
+driver does not pin everything the count follows: by the same arithmetic
+`GGML_QNN_NO_F16_IO` in the caller's shell gives 47 again, and `GGML_QNN_QUANTIZED`,
+`GGML_QNN_DENYLIST` and `GGML_QNN_DISABLE` change it as well.
 
 `test-kleidiai-coff-patch` needs no HTP and no compiler: it runs
 `kleidiai-patch-coff-asm.cmake` (see Build) with `cmake -P` over generated `.S` fixtures
@@ -692,8 +814,9 @@ exits 1 at the end if any failed; `BUILD_ONLY=1` skips the tests.
   baseline); `--device`, `--list-devices` and reported free memory have all failed to catch
   a silent CPU fallback.
 - The same holds for the NPU, and `llama-bench` hides the evidence: without `-v` it installs a null log callback, so every backend WARN and ERROR is dropped and a degraded NPU leg prints CPU numbers under the `QNN` backend name. The first degrade of a process is therefore also written straight to stderr: `ggml-qnn: NPU degraded (<reason>), claiming no ops for the rest of this process: everything runs on the CPU from here`. So are a session that cannot be re-created (`ggml-qnn: the NPU session could not be re-created, ...`), the first static-budget clamp (`ggml-qnn: <phase> of <key> failed (<code>) on a shape that built before: NPU weight memory is full at <X> MiB committed, ...`) and the one budget-full notice, which after a clamp reads `ggml-qnn: NPU weight memory clamped at <X> MiB after a <phase> failure (code <N>), ...`.
-  A leg that never claimed anything degrades nothing and prints nothing: weights left in `CPU_REPACK`, or the IO cap at a too-large `GGML_QNN_NPAD`. The first fixable IO-cap refusal of a process goes straight to stderr and names the `GGML_QNN_NPAD` and `-ub` that fit, so `llama-bench` shows it without `-v` as well (verified 2026-09-17, when the default cap still covered fp16 graph IO: `-dev QNN` at the default `GGML_QNN_NPAD=512` printed it and left the whole model in `CPU_REPACK`; with the cap unset a K-quant model is now placed on the NPU there).
+  A leg that never claimed anything degrades nothing and prints nothing: weights left in `CPU_REPACK`, or the IO cap at a too-large `GGML_QNN_NPAD`. The first fixable IO-cap refusal of a process goes straight to stderr and names the `GGML_QNN_NPAD` and `-ub` that fit, so `llama-bench` shows it without `-v` as well (verified 2026-09-17, when one 1 MiB default capped every graph: `-dev QNN` at the default `GGML_QNN_NPAD=512` printed it and left the whole model in `CPU_REPACK`; with the fp16 default at 10 MiB a K-quant model is now placed on the NPU there, and by the arithmetic the notice is then about the output layer alone, so it no longer means the leg ran on the CPU).
   The proof that an NPU leg ran is `GGML_QNN_STATS`: `graphs_created` and `exec_count` must be non-zero, and `exec_max_ms` in the millisecond range. The counters add up over every session in the process, and `llama-bench` builds one context per test, each baking its weights at reserve, so a `-p`/`-n` run counts each resident weight's bake once per test: the 2026-09-26 A legs report `weights_baked` 82 for 41 weights on the NPU. `exec_count` counts compute-time executes only, so dividing it by the prefill ubatches (warmup plus repetitions) gives the weights executed on the NPU per prefill ubatch.
+- Placement is not the only thing to prove: check flash attention too. `llama-bench` records the flash attention that was asked for (`flash_attn` -1 is `auto`), not what llama resolved it to, and without `-v` it drops the `resolve_fused_ops` line that says which. Until 2026-09-27 `auto` resolved to off under `-dev QNN` and to on in a CPU leg, so the 2026-09-26 legs differ in it (see point 6 of that subsection). Run the legs with an explicit `-fa on` or `-fa off`, or keep the `-v` log.
 - The 2026-09-26 driver runs (the dated subsection under "Measured comparison") are the first
   here with that proof on record, and they are repeatable from this description. One binary and
   one model for every leg; `llama-bench -t 6 -p 512 -n 64 -r 5 -o jsonl`, only the result lines
@@ -725,18 +848,26 @@ exits 1 at the end if any failed; `BUILD_ONLY=1` skips the tests.
   padded IO at fp32) were seen hanging at the validation execute on QAIRT 2.45, first on
   battery and then on AC. That, and the rest of the IO-size law under `GGML_QNN_NPAD`, was
   measured only on the mixed-dtype path that `e3ba3f695` replaced, whose reference kernel was
-  slow in its own right. On fp16 graph IO the law does not hold: the same bakes, and larger
-  ones up to 2.5 MiB of padded output, passed on 2026-09-27 with the cap lifted, and so did
-  Qwen3-4B at `-ub 512`. So the default cap now covers fp32 graph IO only (an F32 weight, or
-  `GGML_QNN_NO_F16_IO`), where no measurement has shown it can go; for those, pick `GGML_QNN_NPAD`,
-  with a matching `-ub`, by weight width so that `NPAD * max(K, M) * 4` stays under 1 MiB: 32
-  for 4096-wide projections, 16 (below `GGML_QNN_MIN_DIM`, so the CPU) for a 9728-wide FFN;
-  see the `GGML_QNN_NPAD` row.
-- The NPU path does not reproduce the CPU's output. On Qwen3-4B-Q4_K_M (2026-09-27, wikitext-2,
-  8 chunks) its mean KL divergence from a CPU reference is 0.047 with a maximum of 33.7-34.5,
-  and the top token differs at about 3% of positions, at the 32 and at the 512 bucket alike,
-  where a CPU control without repack reads 0.000000. The cause is not identified; fp16 range on
-  activations or outputs and fp16 accumulation are candidates, neither verified. See the
+  slow in its own right. fp16 graph IO ran past that size: the same bakes, and larger ones up
+  to 2.5 MiB of padded output, passed on 2026-09-27 with the cap lifted, and so did Qwen3-4B
+  at `-ub 512`, up to 9.5 MiB. Nothing larger has run, so the default cap for fp16 graph IO
+  is 10 MiB, and whether fp16 graph IO hangs at some larger size is not known. fp32 graph IO
+  (an F32 weight, or `GGML_QNN_NO_F16_IO`) keeps the 1 MiB default, where no measurement has
+  shown it can go further; for those, pick `GGML_QNN_NPAD`, with a matching `-ub`, by weight
+  width so that `NPAD * max(K, M) * 4` stays under 1 MiB: 32 for 4096-wide projections, 16
+  (below `GGML_QNN_MIN_DIM`, so the CPU) for a 9728-wide FFN; see the `GGML_QNN_NPAD` row.
+- The output layer's bake has never run on the device. At `GGML_QNN_NPAD=32` the default cap
+  admits the 151936-wide output layer of Qwen3-4B (9.27 MiB of padded output), and a budget
+  that reaches it bakes 741.9 MiB, against 47.5 MiB for the largest bake on record. See
+  "Routing K-quant weights to the NPU" for how to keep it off the NPU path.
+- With weights on the NPU the output is not the CPU's, and what that is worth is not
+  measured. On Qwen3-4B-Q4_K_M (2026-09-27, wikitext-2, 8 chunks) the KL divergence from a CPU
+  reference has a median of 0.0016-0.0018 and the top token differs at about 3% of positions,
+  which is about what the CPU's own two attention paths, flash attention on and off, differ
+  by (0.0016, 3.1%). The mean (0.015-0.047) and the maximum (20.3-34.9) are set by a few
+  unstable positions and do not rank configurations. The divergence this list first gave as
+  the NPU path's was flash attention, which llama disabled under `-dev QNN`; that is fixed.
+  Not measured: a text without such positions, another model, any task-level quality. See the
   2026-09-27 subsection under Measured comparison.
 - The shared-memory IO path (`GGML_QNN_SHARED_MEM`, `test-qnn-modelscale-shm`) failed
   intermittently on 2026-08-26 and has passed every run since; the failing output was
@@ -768,6 +899,15 @@ at `e6ab7c1a4`).
   during teardown before the CRT flushes it), and the KleidiAI COFF patch, which is still
   needed (upstream still fetches KleidiAI v1.24.0, whose `.S` files lack the branch the patch
   adds).
+- The fork's change to upstream's `src/llama-context.cpp`: `resolve_fused_ops` does not count
+  a device mismatch when the fused op runs on a CPU device and the layer's device keeps its
+  tensors in host memory (`ggml_backend_buft_is_host` of its buffer type; the QNN device's
+  buffer type is the CPU's). So flash attention, and the other fused ops that function
+  resolves (Gated Delta Net, Lightning Indexer, DeepSeek V4 HC), stay enabled when they run on
+  the CPU under `-dev QNN`. Upstream's check disabled flash attention for the whole model as
+  soon as a layer was assigned to QNN, which is what the 2026-09-26 NPU legs and the first
+  2026-09-27 KL divergence runs ran with (see Measured comparison). A device that keeps its
+  tensors in its own memory is judged as upstream judges it.
 - The fork's changes to upstream's OpenCL backend: the recoverable staging- and large-buffer
   allocation (`70a556600`, `cc8b36895`), a superset of upstream #27630 that the 2026-09-22
   merge kept; the Q5_K readback fix (`820d1835b`: upstream `a25c9865f` transposes a Q5_K
