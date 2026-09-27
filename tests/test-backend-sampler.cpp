@@ -2163,5 +2163,9 @@ int main(int argc, char ** argv) {
         run_tests(tests, params);
     }
 
+    // redirected stdout is buffered, and a backend DLL can end the process during teardown
+    // before the CRT flushes it (seen with the OpenCL backend on Windows ARM64)
+    fflush(stdout);
+
     return 0;
 }
