@@ -118,9 +118,9 @@ static void ggml_qnn_degrade(ggml_qnn_session * sess, const char * why, bool slo
 }
 
 // page-aligned host buffers for graph IO. kept as allocation hygiene: alignment was ruled
-// out as the cause of the size-threshold execute hang (that follows padded IO transfer size
-// alone - keep max(input, output) under ~1 MB via the pad bucket, see GGML_QNN_NPAD and the
-// GGML_QNN_IO_MAX_KB cap)
+// out as the cause of the size-threshold execute hang (that followed padded IO transfer size
+// alone, on the mixed-dtype path; fp16 graph IO ran well past it, see ggml_qnn_graph::n_pad
+// and the GGML_QNN_IO_MAX_KB cap in ggml_qnn_io_capped)
 static void * ggml_qnn_host_alloc(size_t size) {
 #ifdef _WIN32
     return _aligned_malloc(size, 4096);
@@ -295,6 +295,29 @@ static long long ggml_qnn_test_delay_ms(const std::function<std::string()> & key
     return ms;
 }
 
+// test-only fault hook GGML_QNN_FAIL_EXECUTE, see qnn-lib.h: whether this execute of the graph
+// with this key fails before QNN is called. the match count is guarded by the session mutex,
+// key_of builds the key only when the hook is set
+static bool ggml_qnn_test_fail_execute(const std::function<std::string()> & key_of) {
+    static const char *    sub  = getenv("GGML_QNN_FAIL_EXECUTE");
+    static const long long skip = ggml_qnn_env_ll("GGML_QNN_FAIL_EXECUTE_SKIP", 0, 0);
+    static long long       seen = 0;
+    if (!sub || !*sub) {
+        return false;
+    }
+    const std::string key = key_of();
+    if (key.find(sub) == std::string::npos || seen++ < skip) {
+        return false;
+    }
+    GGML_LOG_WARN("ggml-qnn: GGML_QNN_FAIL_EXECUTE matches %s, injecting an execute failure\n", key.c_str());
+    return true;
+}
+
+static bool ggml_qnn_no_prevalidate(void) {
+    static const bool on = getenv("GGML_QNN_NO_PREVALIDATE") != nullptr;
+    return on;
+}
+
 // returns true if the call completed, writing its result to *out. false means the call did
 // not complete: a timeout, or no worker thread could be started. either way the session is
 // degraded when this returns false (the timeout callers degrade it themselves, with the phase
@@ -412,6 +435,14 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
         GGML_LOG_INFO("ggml-qnn: disabled by GGML_QNN_DISABLE\n");
         return nullptr;
     }
+    // test-only fault hook, see qnn-lib.h. the caller serializes session init, so the count
+    // needs no lock of its own
+    static const long long fail_init = ggml_qnn_env_ll("GGML_QNN_FAIL_INIT", -1, 0);
+    static long long       n_inits   = 0;
+    if (fail_init >= 0 && n_inits++ == fail_init) {
+        GGML_LOG_WARN("ggml-qnn: GGML_QNN_FAIL_INIT=%lld, injecting a failure of session init %lld\n", fail_init, n_inits);
+        return nullptr;
+    }
     void * lib = ggml_qnn_load_htp_lib();
     if (!lib) {
         return nullptr;
@@ -482,14 +513,12 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
         return nullptr;
     }
 
-    // tell QNN which HTP it is building for. Creating the device with a null config leaves the
-    // arch unset, and the backend then falls back to a generic path that computes the RIGHT
-    // numbers at roughly scalar speed - which is exactly the symptom measured on 2026-09-23:
-    // one 84 M-MAC fp16 matmul took 13.1 s on an idle box, while Genie, whose own
-    // htp_backend_ext_config.json declares soc_model 60 / dsp_arch v73, ran a whole 4B model on
-    // the same HTP in 17.6 s. The arch is QUERIED from the device rather than hardcoded so this
-    // stays correct on any SoC; GGML_QNN_HTP_ARCH (68, 69, 73, 75, 79, 81, 85, 89) forces it
-    // when the query is unavailable, and 0 restores the old null-config behaviour for A/B.
+    // tell QNN which HTP it is building for. A null device config leaves the arch unset, which
+    // was a gap, so the arch and the SoC are set. It has no measured effect: the 13.1 s matmul of
+    // 2026-09-23 took the same time with the arch set, and its cause was the mixed-dtype matmul,
+    // see ggml_qnn_graph::f16_io. The arch is QUERIED from the device rather than hardcoded so
+    // this stays correct on any SoC; GGML_QNN_HTP_ARCH (68, 69, 73, 75, 79, 81, 85, 89) forces it
+    // when the query is unavailable, and 0 keeps the null config.
     QnnHtpDevice_Arch_t htp_arch  = QNN_HTP_DEVICE_ARCH_NONE;
     uint32_t            soc_model = 0;
 
@@ -558,8 +587,7 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
         dev_cfg = soc_model ? cfg_both : cfg_only;
         GGML_LOG_INFO("ggml-qnn: HTP arch v%d, SoC model %u\n", (int) htp_arch, soc_model);
     } else {
-        GGML_LOG_WARN("ggml-qnn: HTP arch unknown, creating the device without one - expect "
-                      "correct results at reference speed; set GGML_QNN_HTP_ARCH (e.g. 73)\n");
+        GGML_LOG_WARN("ggml-qnn: HTP arch unknown, creating the device without one; set GGML_QNN_HTP_ARCH (e.g. 73)\n");
     }
 
     err = sess->iface.deviceCreate(sess->log_handle, dev_cfg, &sess->device_handle);
@@ -578,10 +606,12 @@ ggml_qnn_session * ggml_qnn_session_init(void) {
 
     GGML_LOG_INFO("ggml-qnn: initialized Hexagon NPU (HTP)\n");
 
-    // unlimited static pinning exhausts NPU mapped memory on full models, which can poison
-    // the context, so cap it by default. 1024 as a margin: the HTP stopped mapping baked
-    // weights at about 1170 MiB committed in one run on a machine loaded with other work
-    // (QAIRT 2.45, X Elite, 2026-09-16), not reproduced on an idle one
+    // unlimited static pinning exhausts NPU mapped memory on full models. only a failure on a
+    // shape already proven in the session is recognized as that (ggml_qnn_budget_clamp); on
+    // any other shape it denylists the shape or degrades the session, so cap it by default.
+    // 1024 as a margin below both ceilings seen on QAIRT 2.45, X Elite: about 1170 MiB
+    // committed on a machine loaded with other work (2026-09-16, the budget at its old 2048
+    // default) and 1830.0 MiB on a near-idle one with the budget lifted (2026-09-26)
     sess->static_budget = (size_t) ggml_qnn_env_ll("GGML_QNN_STATIC_BUDGET_MB", 1024, 0) * 1024 * 1024;
     if (sess->static_budget) {
         GGML_LOG_INFO("ggml-qnn: static-weight budget %zu MB\n", sess->static_budget / (1024 * 1024));
@@ -730,9 +760,11 @@ static uint32_t ggml_qnn_pad_n(uint32_t n) {
     return p;
 }
 
-// 64-bit FNV-1a over the byte count and the first and last 512 bytes of a resident weight:
+// 64-bit FNV-1a over the byte count, the first and last 512 bytes and, past 1 KiB, 64 strided
+// 8-byte samples at i * stride + stride / 2 (stride = nbytes / 64) of a resident weight:
 // content identity beside the address, so an address reused after a model unload does not
-// serve the previous model's bake. the old bake stays charged to the static budget, because
+// serve the previous model's bake. the samples span the whole tensor, so two weights with the
+// same head and tail do not alias. the old bake stays charged to the static budget, because
 // QNN keeps its graph until contextFree. it runs on every graph lookup, before the cache is
 // consulted, so it mixes a 64-bit word per step and only the tail bytes singly
 static uint64_t ggml_qnn_weight_fingerprint(const ggml_tensor * w) {
@@ -758,6 +790,14 @@ static uint64_t ggml_qnn_weight_fingerprint(const ggml_tensor * w) {
     const uint8_t * data = (const uint8_t *) w->data;
     mix(data, span);
     mix(data + nbytes - span, span);
+    // head and tail already cover a tensor of 1 KiB or less
+    const size_t n_samples = 64;
+    if (nbytes > 2 * span) {
+        const size_t stride = nbytes / n_samples;
+        for (size_t i = 0; i < n_samples; i++) {
+            mix(data + i * stride + stride / 2, sizeof(uint64_t));
+        }
+    }
     return h;
 }
 
@@ -833,9 +873,29 @@ static std::vector<uint32_t> ggml_qnn_dims(const ggml_tensor * t) {
     return dims;
 }
 
+// the mixed-dtype matmul this replaces ran 400-950x slower than the same shape with an f32
+// weight; see ggml_qnn_graph::f16_io. Off only for reproducing that
+static bool ggml_qnn_no_f16_io() {
+    static const bool off = getenv("GGML_QNN_NO_F16_IO") != nullptr;
+    return off;
+}
+
+// graph IO is fp16 whenever the weight is, so the cap must measure the bytes the graph will
+// really allocate. Counting 4 per element there refuses shapes that now fit in half the space.
+// the element size also decides whether the default cap applies at all: it caps 4-byte IO
+// only, see ggml_qnn_io_capped
+static uint64_t ggml_qnn_io_elem_size(const ggml_tensor * node) {
+    const bool f16 = !ggml_qnn_no_f16_io() && node->op == GGML_OP_MUL_MAT &&
+                     ggml_qnn_weight_dtype(node->src[0]->type) == QNN_DATATYPE_FLOAT_16;
+    return f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+}
+
 // shape-only key: stable across runs, used for the failed-shape denylist. is_static picks the
 // variant tag, which matters: static-baked and dynamic-weight graphs are different HTP
-// programs with different finalize outcomes, a denylist entry must only ban the one that failed
+// programs with different finalize outcomes, a denylist entry must only ban the one that failed.
+// the IO dtype is tagged for the same reason ("_io16" for fp16 graph IO, see
+// ggml_qnn_graph::f16_io), in front of the variant tag, so every static graph key still
+// carries "_s_w"
 // n_bucket overrides the batch bucket the key is built in, 0 means the node's own. the
 // placement probe needs the override: llama hands weight_buft_supported a fictitious N, so a
 // key built from it names a graph nothing ever runs, while the entries already in the denylist
@@ -850,10 +910,11 @@ static std::string ggml_qnn_shape_key(const ggml_tensor * node, bool is_static, 
         : src1->ne[1];
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "%s_%s_%s_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "%s",
+    snprintf(buf, sizeof(buf), "%s_%s_%s_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "_%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "%s%s",
              ggml_op_name(node->op), ggml_type_name(src0->type), ggml_type_name(src1->type),
              src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
              src1->ne[0], ne11, src1->ne[2], src1->ne[3],
+             ggml_qnn_io_elem_size(node) == sizeof(ggml_fp16_t) ? "_io16" : "",
              is_static ? "_s" : "_dyn");
     return buf;
 }
@@ -874,34 +935,35 @@ static std::string ggml_qnn_graph_key(const ggml_tensor * node) {
     return key;
 }
 
-// the IO-size cap, see ggml_qnn_graph::n_pad. logged once per shape key: the same shape
-// comes back once per weight and per session, and DEBUG once is enough to explain a CPU
-// placement
+// the IO-size cap, see ggml_qnn_graph::n_pad. GGML_QNN_IO_MAX_KB set to a number caps every
+// matmul graph at that size. unset, the default 1024 caps only the graphs whose IO is 4 bytes
+// per element (an F32 weight, or any weight under GGML_QNN_NO_F16_IO): the hang the cap exists
+// for was measured on the mixed-dtype path, fp16 graph IO ran far past 1 MiB without it, and
+// capping fp16 IO only forced small ubatches. a malformed value warns and counts as unset.
+// logged once per shape key: the same shape comes back once per weight and per session, and
+// DEBUG once is enough to explain a CPU placement
 //
-// the first refusal of the process is a WARN that names the way out: with -dev QNN at the
-// default GGML_QNN_NPAD every weight of a 4B model is refused here, and at DEBUG alone the
-// user who asked for the NPU got a CPU run with no line saying why
-// the mixed-dtype matmul this replaces ran 400-950x slower than the same shape with an f32
-// weight; see ggml_qnn_graph::f16_io. Off only for reproducing that
-static bool ggml_qnn_no_f16_io() {
-    static const bool off = getenv("GGML_QNN_NO_F16_IO") != nullptr;
-    return off;
-}
-
-// graph IO is fp16 whenever the weight is, so the cap must measure the bytes the graph will
-// really allocate. Counting 4 per element there refuses shapes that now fit in half the space
-static uint64_t ggml_qnn_io_elem_size(const ggml_tensor * node) {
-    const bool f16 = !ggml_qnn_no_f16_io() && node->op == GGML_OP_MUL_MAT &&
-                     ggml_qnn_weight_dtype(node->src[0]->type) == QNN_DATATYPE_FLOAT_16;
-    return f16 ? sizeof(ggml_fp16_t) : sizeof(float);
-}
-
+// the first refusal of the process is a WARN that names the way out: at the default
+// GGML_QNN_NPAD an F32 weight 512 or more wide is refused here (and, with the cap set to 1024,
+// every weight of a 4B model), and at DEBUG alone the user who asked for the NPU got a CPU run
+// with no line saying why
 static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
-    static const uint64_t cap = (uint64_t) ggml_qnn_env_ll("GGML_QNN_IO_MAX_KB", 1024, 1) * 1024;
-    const uint64_t elem      = ggml_qnn_io_elem_size(node);
+    struct io_cap {
+        uint64_t bytes;
+        bool     set; // GGML_QNN_IO_MAX_KB parsed: the cap covers fp16 graph IO too
+    };
+    static const io_cap cap = [] {
+        bool set = false;
+        const long long kb = ggml_qnn_env_ll("GGML_QNN_IO_MAX_KB", 1024, 1, &set);
+        return io_cap{ (uint64_t) kb * 1024, set };
+    }();
+    const uint64_t elem = ggml_qnn_io_elem_size(node);
+    if (!cap.set && elem == sizeof(ggml_fp16_t)) {
+        return false;
+    }
     const uint64_t in_bytes  = (uint64_t) node->src[1]->ne[0] * pad * elem;
     const uint64_t out_bytes = (uint64_t) node->src[0]->ne[1] * pad * elem;
-    if (std::max(in_bytes, out_bytes) < cap) {
+    if (std::max(in_bytes, out_bytes) < cap.bytes) {
         return false;
     }
     static std::mutex                       logged_mutex;
@@ -919,22 +981,30 @@ static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
         // the largest power-of-two batch whose padded IO still fits under the cap
         const uint64_t row_bytes = std::max<uint64_t>(node->src[1]->ne[0], node->src[0]->ne[1]) * elem;
         uint32_t fit = 0;
-        for (uint32_t p = 1; (uint64_t) p * row_bytes < cap; p <<= 1) {
+        for (uint32_t p = 1; (uint64_t) p * row_bytes < cap.bytes; p <<= 1) {
             fit = p;
         }
-        // warn only when a setting can fix it. supports_op refuses batches under
-        // GGML_QNN_MIN_DIM, so a shape that fits only below that (a 151936-wide output layer,
-        // a 9728-wide FFN) never runs here at any setting: it stays at DEBUG and does not
-        // spend the one WARN a fixable refusal needs
+        // warn only when a pad bucket can fix it. supports_op refuses batches under
+        // GGML_QNN_MIN_DIM, so a shape that fits only below that (at a 1 MiB cap: a 151936-wide
+        // output layer; a 9728-wide FFN only at 4 bytes per element, an F32 weight or
+        // GGML_QNN_NO_F16_IO, since at 2 it fits at 32) never runs here at that cap: it stays at
+        // DEBUG and does not spend the one WARN a fixable refusal needs
         static const uint32_t min_dim = (uint32_t) ggml_qnn_env_ll("GGML_QNN_MIN_DIM", 32, 1);
         if (fit >= min_dim) {
             warned = true;
+            // which cap refused it, so the line names the right lever: a set GGML_QNN_IO_MAX_KB
+            // caps every graph; the default caps 4-byte graph IO only, which an F16 or quantized
+            // weight has only under GGML_QNN_NO_F16_IO
+            const char * cap_src = cap.set ? "GGML_QNN_IO_MAX_KB"
+                                 : ggml_qnn_weight_dtype(node->src[0]->type) == QNN_DATATYPE_FLOAT_16
+                                     ? "the GGML_QNN_IO_MAX_KB default for fp32 graph IO, which GGML_QNN_NO_F16_IO selects"
+                                     : "the GGML_QNN_IO_MAX_KB default for fp32 graph IO";
             // straight to stderr, like the first degrade: llama-bench without -v installs a null
             // log callback and would report a CPU run under the QNN backend name with no hint
             fprintf(stderr, "ggml-qnn: a %s %" PRId64 "x%" PRId64 " matmul stays on the CPU: its padded IO is %.1f MiB at N=%u, at or over the %.1f MiB cap "
-                            "(GGML_QNN_IO_MAX_KB); GGML_QNN_NPAD=%u with -ub %u (or lower) fits it. later IO-cap refusals are logged at DEBUG\n",
+                            "(%s); GGML_QNN_NPAD=%u with -ub %u (or lower) fits it. later IO-cap refusals are logged at DEBUG\n",
                     ggml_type_name(node->src[0]->type), node->src[0]->ne[0], node->src[0]->ne[1],
-                    std::max(in_bytes, out_bytes) / (1024.0 * 1024.0), pad, cap / (1024.0 * 1024.0), fit, fit);
+                    std::max(in_bytes, out_bytes) / (1024.0 * 1024.0), pad, cap.bytes / (1024.0 * 1024.0), cap_src, fit, fit);
             fflush(stderr);
         }
     }
@@ -951,7 +1021,8 @@ bool ggml_qnn_mul_mat_arith_reject(const ggml_tensor * op, bool placement_probe)
     if (K * Nb * io_elem > UINT32_MAX || M * Nb * io_elem > UINT32_MAX) {
         return true;
     }
-    // a padded IO buffer at or past the cap hangs the execute (the padded-IO size law)
+    // a padded IO buffer at or past the cap hung the execute on the mixed-dtype path (the
+    // padded-IO size law); unset, the cap covers 4-byte graph IO only, see ggml_qnn_io_capped
     return ggml_qnn_io_capped(op, Nb);
 }
 
@@ -990,9 +1061,17 @@ static bool ggml_qnn_mul_mat_policy(ggml_qnn_session * sess, ggml_qnn_graph & g,
                            committed / (1024.0 * 1024.0), sess->static_budget / (1024.0 * 1024.0));
             static std::atomic<bool> budget_reported{false};
             if (!budget_reported.exchange(true)) {
-                fprintf(stderr, "ggml-qnn: the %.0f MiB static-weight budget is full (%.1f MiB committed), so further weights stay on "
-                                "the CPU; GGML_QNN_STATIC_BUDGET_MB raises it, 0 lifts it. later refusals are logged at DEBUG\n",
-                        sess->static_budget / (1024.0 * 1024.0), committed / (1024.0 * 1024.0));
+                // a clamped budget is the device refusing more weight memory: raising or lifting
+                // GGML_QNN_STATIC_BUDGET_MB cannot help, and the run may already have set 0
+                if (sess->budget_clamped) {
+                    fprintf(stderr, "ggml-qnn: NPU weight memory clamped at %.1f MiB after a %s failure (code %" PRIu64 "), so further "
+                                    "weights stay on the CPU. later refusals are logged at DEBUG\n",
+                            sess->static_budget / (1024.0 * 1024.0), sess->clamp_phase, (uint64_t) sess->clamp_err);
+                } else {
+                    fprintf(stderr, "ggml-qnn: the %.0f MiB static-weight budget is full (%.1f MiB committed), so further weights stay on "
+                                    "the CPU; GGML_QNN_STATIC_BUDGET_MB raises it, 0 lifts it. later refusals are logged at DEBUG\n",
+                            sess->static_budget / (1024.0 * 1024.0), committed / (1024.0 * 1024.0));
+                }
                 fflush(stderr);
             }
             g.policy_reject = true;
@@ -1420,8 +1499,11 @@ static void ggml_qnn_graph_release_buffers(ggml_qnn_session * sess, ggml_qnn_gra
 // 2.45), which is why the shape history decides and not the error. clamp the budget to what
 // is committed so ggml_qnn_mul_mat_policy rejects every further static bake; 0 would mean
 // unlimited, hence the floor of 1. every later bake is then refused by policy, so this runs
-// at most once per session
+// at most once per session.
+// the first clamp of the process goes straight to stderr, like the first degrade: llama-bench
+// without -v installs a null log callback, and the error code was then never recorded
 static void ggml_qnn_budget_clamp(ggml_qnn_session * sess, const std::string & key, const char * phase, Qnn_ErrorHandle_t err) {
+    static std::atomic<bool> reported{false};
     const size_t committed = ggml_qnn_static_committed.load();
     const size_t clamp     = std::max<size_t>(committed, 1);
     if (!sess->static_budget || sess->static_budget > clamp) {
@@ -1430,9 +1512,18 @@ static void ggml_qnn_budget_clamp(ggml_qnn_session * sess, const std::string & k
     ggml_qnn_stat_budget_clamped.store(1);
     if (!sess->budget_clamped) {
         sess->budget_clamped = true;
-        GGML_LOG_WARN("ggml-qnn: %s of %s failed (%" PRIu64 ") on a shape that built before: NPU weight memory is full at %.1f MiB committed, "
-                      "further weights stay on the CPU (a lower GGML_QNN_STATIC_BUDGET_MB avoids the failed attempt)\n",
-                      phase, key.c_str(), (uint64_t) err, committed / (1024.0 * 1024.0));
+        sess->clamp_phase    = phase;
+        sess->clamp_err      = err;
+        if (!reported.exchange(true)) {
+            fprintf(stderr, "ggml-qnn: %s of %s failed (%" PRIu64 ") on a shape that built before: NPU weight memory is full at %.1f MiB committed, "
+                            "further weights stay on the CPU (a lower GGML_QNN_STATIC_BUDGET_MB avoids the failed attempt)\n",
+                    phase, key.c_str(), (uint64_t) err, committed / (1024.0 * 1024.0));
+            fflush(stderr);
+        } else {
+            GGML_LOG_WARN("ggml-qnn: %s of %s failed (%" PRIu64 ") on a shape that built before: NPU weight memory is full at %.1f MiB committed, "
+                          "further weights stay on the CPU (a lower GGML_QNN_STATIC_BUDGET_MB avoids the failed attempt)\n",
+                          phase, key.c_str(), (uint64_t) err, committed / (1024.0 * 1024.0));
+        }
     }
 }
 
@@ -1647,7 +1738,7 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
         // at execute is rejected here, at supports_op time, instead of aborting a llama_decode
         // batch later. an execute failure can poison the shared context, so it degrades the
         // session, unless the shape is proven and the failure is weight memory running out
-        if (ok && !getenv("GGML_QNN_NO_PREVALIDATE")) {
+        if (ok && !ggml_qnn_no_prevalidate()) {
             Qnn_GraphHandle_t        h     = g.handle;
             Qnn_Tensor_t *           ins   = g.inputs.data();
             uint32_t                 n_ins = (uint32_t) g.inputs.size();
@@ -1655,15 +1746,10 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
             QNN_INTERFACE_VER_TYPE * ifp   = &sess->iface;
             Qnn_ErrorHandle_t        err   = QNN_SUCCESS;
             bool                     completed = true;
-            // test-only fault hook, see qnn-lib.h: fail before QNN is called. the match
-            // count is guarded by the session mutex like the rest of this function
-            static const char *    fail_sub  = getenv("GGML_QNN_FAIL_EXECUTE");
-            static const long long fail_skip = ggml_qnn_env_ll("GGML_QNN_FAIL_EXECUTE_SKIP", 0, 0);
-            static long long       fail_seen = 0;
-            const bool inject = fail_sub && *fail_sub && key.find(fail_sub) != std::string::npos && fail_seen++ >= fail_skip;
+            // test-only fault hook, see qnn-lib.h: fail before QNN is called
+            const bool inject = ggml_qnn_test_fail_execute([&key]() { return key; });
             const auto t_val = std::chrono::steady_clock::now();
             if (inject) {
-                GGML_LOG_WARN("ggml-qnn: GGML_QNN_FAIL_EXECUTE matches %s, injecting an execute failure\n", key.c_str());
                 err = QNN_COMMON_ERROR_SYSTEM;
             } else {
                 // test-only, see qnn-lib.h: the delay runs inside the timed call, and the
@@ -1710,7 +1796,8 @@ static ggml_qnn_graph * ggml_qnn_get_graph(ggml_qnn_session * sess, const ggml_t
                 ggml_qnn_degrade(sess, "validation execute failed");
                 ok = false;
             } else if (!inject && ggml_qnn_slow_exec_ms() > 0 && validate_ms >= (double) ggml_qnn_slow_exec_ms()) {
-                // a healthy HTP executes any shape under the IO cap in ms. seconds means the
+                // a healthy HTP executes a matmul in milliseconds (Qwen3-4B's projections at
+                // the 512 bucket peaked at 18 and 46 ms in two runs, 2026-09-27). seconds means the
                 // device is running far below normal speed or the machine is busy. either is
                 // a condition, not a verdict on the shape: no denylist, and the whole session
                 // falls back to the CPU
@@ -1858,16 +1945,23 @@ enum ggml_status ggml_qnn_compute_node(ggml_qnn_session * sess, struct ggml_tens
     QNN_INTERFACE_VER_TYPE * ifp   = &sess->iface;
     Qnn_ErrorHandle_t        err   = QNN_SUCCESS;
     const long long limit_ms = ggml_qnn_compute_timeout_ms();
-    // test-only, see qnn-lib.h and the validation execute in ggml_qnn_get_graph
-    const long long delay_ms = ggml_qnn_test_delay_ms([node]() { return ggml_qnn_graph_key(node); });
+    // test-only, see qnn-lib.h and the validation execute in ggml_qnn_get_graph. with no
+    // validation execute, the fault hook fails this one: the error-return path below
+    const bool inject = ggml_qnn_no_prevalidate() && ggml_qnn_test_fail_execute([node]() { return ggml_qnn_graph_key(node); });
+    const long long delay_ms = inject ? 0 : ggml_qnn_test_delay_ms([node]() { return ggml_qnn_graph_key(node); });
     const auto t_exec = std::chrono::steady_clock::now();
-    const bool completed = ggml_qnn_call_timed(sess, limit_ms,
-        [ifp, h, ins, n_ins, out, delay_ms]() {
-            if (delay_ms > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-            }
-            return ifp->graphExecute(h, ins, n_ins, out, 1, nullptr, nullptr);
-        }, &err);
+    bool completed = true;
+    if (inject) {
+        err = QNN_COMMON_ERROR_SYSTEM;
+    } else {
+        completed = ggml_qnn_call_timed(sess, limit_ms,
+            [ifp, h, ins, n_ins, out, delay_ms]() {
+                if (delay_ms > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                }
+                return ifp->graphExecute(h, ins, n_ins, out, 1, nullptr, nullptr);
+            }, &err);
+    }
     const uint64_t exec_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_exec).count();
     ggml_qnn_stat_exec_count.fetch_add(1);
     if (exec_ms > ggml_qnn_stat_exec_max_ms.load()) {

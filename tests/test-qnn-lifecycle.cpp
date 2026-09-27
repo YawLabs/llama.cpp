@@ -10,16 +10,20 @@
 // unsets every GGML_QNN_* variable the backend reads, so a shell that exports GGML_QNN_NPAD,
 // GGML_QNN_DISABLE or a denylist does not change a verdict. what survives: the variable a ctest
 // ENVIRONMENT property sets for the variant, GGML_QNN_DEBUG (log verbosity only), and for the
-// bigstatic and health modes the caller's GGML_QNN_TIMEOUT_MS, GGML_QNN_BUILD_TIMEOUT_MS and
-// GGML_QNN_SLOW_EXEC_MS (bigstatic also keeps GGML_QNN_NPAD and GGML_QNN_IO_MAX_KB):
+// bigstatic and health modes the caller's GGML_QNN_TIMEOUT_MS, GGML_QNN_BUILD_TIMEOUT_MS,
+// GGML_QNN_SLOW_EXEC_MS and GGML_QNN_NO_F16_IO (bigstatic also keeps GGML_QNN_NPAD and
+// GGML_QNN_IO_MAX_KB):
 //
 //   test-qnn-lifecycle basic      correctness of the static-weight path vs the CPU backend
 //                                 (f32/f16/quantized weights, N below/at/above the pad
-//                                 bucket), probe/free/reacquire cycle, clean exit
+//                                 bucket), the IO-cap refusal of an fp16-IO graph at a
+//                                 GGML_QNN_IO_MAX_KB=1024 main sets, probe/free/reacquire
+//                                 cycle, clean exit
 //   test-qnn-lifecycle budget     a tiny budget refuses a weight as a policy reject and does
 //                                 NOT denylist it; committed bytes return on session free;
 //                                 a quantized weight is charged at its fp16 on-device size
-//   test-qnn-lifecycle denylist [noopt]  a seeded static-variant entry blocks that shape; a
+//   test-qnn-lifecycle denylist [noopt]  a seeded file (header line plus shape keys, the bytes
+//                                 the backend writes): a static-variant entry blocks that shape; a
 //                                 dynamic-variant entry does not block the static path; the
 //                                 unallocated (load-time) probe is refused for both variants.
 //                                 "noopt" sets GGML_QNN_NO_OPT, under which file entries are
@@ -47,8 +51,8 @@
 //   test-qnn-lifecycle bigstatic [i]   diagnostic, NOT a gate (no ctest entry): 512-class
 //                                 static bakes that discriminate the padded-IO-size hang
 //                                 thresholds (GGML_QNN_IO_MAX_KB is lifted so they can reach
-//                                 them). optional case index i runs a single case, for
-//                                 order/isolation permutations
+//                                 them under a caller's GGML_QNN_NO_F16_IO too). optional case
+//                                 index i runs a single case, for order/isolation permutations
 //   test-qnn-lifecycle modelscale [npad] [env]   green guard for the WORKING side of the
 //                                 IO-size law: model-scale static bake at a small pad bucket
 //                                 plus bucket-boundary correctness; npad defaults to 64, "0"
@@ -62,7 +66,10 @@
 //                                 under GGML_QNN_TEST_REQUIRE_HTP=1, which first loads QnnHtp
 //                                 directly and fails if the runtime itself is not loadable)
 //   test-qnn-lifecycle mindim     at DEFAULT env the min-dim gate refuses small matmuls
-//                                 while claiming normal ones; the default of 32 is pinned
+//                                 while claiming normal ones; the default of 32 is pinned.
+//                                 and with GGML_QNN_IO_MAX_KB unset the IO cap covers fp32
+//                                 graph IO only: an F16 weight whose padded IO is over 1 MiB
+//                                 is claimed and computes, an F32 one at 1 MiB is refused
 //   test-qnn-lifecycle elementwise  at DEFAULT env ADD/MUL must be refused (the HTP has a
 //                                 known broadcast bug), while mul_mat is still claimed
 //   test-qnn-lifecycle elementwise-on  with GGML_QNN_ELEMENTWISE=1 the GGML_QNN_MIN_ELEMENTS gate
@@ -76,7 +83,9 @@
 //                                 against the same weight resident in an untagged buffer.
 //                                 the padded-IO cap is part of that answer: a capped
 //                                 buffer-less matmul and a weight capped at the smallest
-//                                 bucket are refused, never claimed and failed at compute.
+//                                 bucket are refused, never claimed and failed at compute
+//                                 (main sets GGML_QNN_IO_MAX_KB=1024, so the cap covers the
+//                                 fp16-IO weights these cases use).
 //                                 also the refusals decided by form alone (3D, strided, BF16
 //                                 weight, F16 activation) and by buffer (a weight in CPU_REPACK,
 //                                 directly and through a reshape; supports_buft)
@@ -98,17 +107,19 @@
 //                                 again instead of serving the stale graph
 //   test-qnn-lifecycle dyncache   GGML_QNN_NO_STATIC_WEIGHTS: the dynamic path copies a weight
 //                                 once and skips the copy while address and fingerprint hold,
-//                                 and re-copies new content at the same address
+//                                 and re-copies new content at the same address, also when
+//                                 only the bytes between an unchanged head and tail are new
 //   test-qnn-lifecycle quantized  GGML_QNN_QUANTIZED: an untagged Q4_0 weight (fp16 on the
 //                                 device, one small graph) is claimed on the per-execute dequant
 //                                 path and matches the CPU
 //   test-qnn-lifecycle envparse   malformed GGML_QNN_NPAD, GGML_QNN_MIN_DIM and
-//                                 GGML_QNN_IO_MAX_KB values fall back to their defaults
+//                                 GGML_QNN_IO_MAX_KB values fall back to their defaults; a
+//                                 malformed cap behaves as unset, capping fp32 graph IO only
 //
-// The modes below drive the test-only hooks GGML_QNN_DELAY_EXECUTE and GGML_QNN_FAIL_FINALIZE
-// (qnn-lib.h) on small F32 shapes at GGML_QNN_NPAD=64, so their thresholds do not depend on
-// device speed. Those marked [marker] keep a degraded session, print <TAG>-CHECKS-PASSED and
-// end through hard_exit like watchdog:
+// The modes below drive the test-only hooks GGML_QNN_DELAY_EXECUTE, GGML_QNN_FAIL_FINALIZE,
+// GGML_QNN_FAIL_EXECUTE and GGML_QNN_FAIL_INIT (qnn-lib.h) on small F32 shapes at
+// GGML_QNN_NPAD=64, so their thresholds do not depend on device speed. Those marked [marker]
+// keep a degraded session, print <TAG>-CHECKS-PASSED and end through hard_exit like watchdog:
 //
 //   test-qnn-lifecycle slow-validate  [marker SLOW-VALIDATE] a validation execute delayed past
 //                                 GGML_QNN_SLOW_EXEC_MS completes: the shape is not claimed and
@@ -124,11 +135,22 @@
 //                                 in the session, never in the cold leg
 //   test-qnn-lifecycle compute-timeout  [marker COMPUTE-TIMEOUT] with GGML_QNN_NO_PREVALIDATE a
 //                                 compute delayed past GGML_QNN_TIMEOUT_MS fails the node and
-//                                 hard-degrades the session; not persisted
+//                                 hard-degrades the session (a graph built before it fails
+//                                 too, not only the demoted one); not persisted
+//   test-qnn-lifecycle compute-error  [marker COMPUTE-ERROR] with GGML_QNN_NO_PREVALIDATE,
+//                                 GGML_QNN_FAIL_EXECUTE fails the first compute with an error
+//                                 return: the node fails, the session hard-degrades (a graph
+//                                 built before it fails too), not persisted, and a re-init
+//                                 keeps the degraded session
 //   test-qnn-lifecycle finalize-error  a finalize error on an unproven shape is persisted and
 //                                 refused; on a proven shape it clamps the budget instead
 //   test-qnn-lifecycle denylist-append  the backend appends to a non-empty denylist file that
 //                                 lacks a trailing newline: newline repaired, no header
+//   test-qnn-lifecycle reinit-fail  GGML_QNN_FAIL_INIT fails the re-init after a working
+//                                 session was freed: init still returns a backend, through the
+//                                 cached device and through the registry's live device count
+//                                 (ggml_backend_qnn_init's path), it claims nothing and fails
+//                                 a compute, and the failure is latched
 //
 // Checks that exercise the backend are counted (check); checks that only prove the test's
 // own wiring (the CPU backend, an env var the runner must set, a path main configured) are
@@ -141,6 +163,9 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#ifndef GGML_BACKEND_DL
+#    include "ggml-qnn.h" // ggml_backend_qnn_init, called directly by reinit-fail
+#endif
 
 #include <chrono>
 #include <cinttypes>
@@ -214,15 +239,15 @@ static void check(bool ok, const char * what) {
 // deliberately kept (degraded) is still alive, and QnnHtp has been seen crashing in its
 // detach with such a session - a ctest "Exception" that PASS_REGULAR_EXPRESSION cannot
 // rescue and that would fail a run whose checks all passed. stdout is flushed first because
-// nothing after this point runs
-static void hard_exit(int rc) {
+// nothing after this point runs. _exit is only reached if TerminateProcess returns, and it
+// makes the function noreturn on every platform
+[[noreturn]] static void hard_exit(int rc) {
     fflush(stdout);
     fflush(stderr);
 #ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), (UINT) rc);
-#else
-    _exit(rc);
 #endif
+    _exit(rc);
 }
 
 static void fill_uniform(std::vector<float> & v, unsigned seed) {
@@ -260,11 +285,13 @@ static int64_t pad_n_for(int64_t npad, int64_t n) {
 }
 
 // the backend's shape-only key (ggml_qnn_shape_key) for a 2D mul_mat with f32 activations:
-// what the denylist file stores, and what GGML_QNN_FAIL_EXECUTE matches against
+// what the denylist file stores, and what GGML_QNN_FAIL_EXECUTE matches against. graph IO is
+// fp16, tagged "_io16", for every weight type but F32 unless GGML_QNN_NO_F16_IO is set
 static std::string shape_key(const mul_mat_case & c, int64_t npad, bool is_static) {
+    const bool io16 = c.wtype != GGML_TYPE_F32 && getenv("GGML_QNN_NO_F16_IO") == nullptr;
     char buf[160];
-    snprintf(buf, sizeof(buf), "MUL_MAT_%s_f32_%" PRId64 "x%" PRId64 "x1x1_%" PRId64 "x%" PRId64 "x1x1_%s",
-             ggml_type_name(c.wtype), c.K, c.M, c.K, pad_n_for(npad, c.N), is_static ? "s" : "dyn");
+    snprintf(buf, sizeof(buf), "MUL_MAT_%s_f32_%" PRId64 "x%" PRId64 "x1x1_%" PRId64 "x%" PRId64 "x1x1%s_%s",
+             ggml_type_name(c.wtype), c.K, c.M, c.K, pad_n_for(npad, c.N), io16 ? "_io16" : "", is_static ? "s" : "dyn");
     return buf;
 }
 
@@ -574,11 +601,14 @@ static int scenario_basic(void) {
     ggml_backend_t cpu = cpu_backend_init();
 
     // batch sizes below / inside / at / above the default 512 pad bucket: a weight must bake
-    // and stay correct at every N (padded IO copy paths). padded IO is in = K * pad * 4 and
-    // out = M * pad * 4 bytes, and GGML_QNN_IO_MAX_KB (default 1024, strict) refuses 1 MiB:
+    // and stay correct at every N (padded IO copy paths). padded IO is in = K * pad * e and
+    // out = M * pad * e bytes, e = 4 for the F32 weight and 2 for the others (their graph IO
+    // is fp16), and the GGML_QNN_IO_MAX_KB=1024 main sets (strict) refuses 1 MiB at either e;
+    // unset, the default would not cap e = 2 at all. at e = 4:
     //   K=256 M=128 pad  512: in 512 KiB, out 256 KiB -> claimed
     //   K=128 M=128 pad 1024: in 512 KiB, out 512 KiB -> claimed, keeps the 1024-bucket copy path under test
-    //   K=256 M=128 pad 1024: in exactly 1 MiB        -> policy reject, asserted after the loop
+    // and half that at e = 2. the refusal, an F16 K=512 M=128 at pad 1024 (in exactly 1 MiB
+    // at e = 2), is asserted after the loop
     struct shape { int64_t K, M, N; };
     const shape shapes[] = {
         { 256, 128,   1 },
@@ -633,9 +663,10 @@ static int scenario_basic(void) {
     // taken before graphCreate. It must not degrade the session, which the compute after the
     // reacquire below would show. (K was 256 while IO was fp32 - halving the element size
     // doubled the K that reaches the cap, which is the point of the fix, so this case moved
-    // with it rather than being weakened.)
+    // with it rather than being weakened.) The refusal needs the cap SET: unset, it covers
+    // fp32 graph IO only and an fp16-IO shape past 1 MiB is claimed, see scenario_mindim
     const mul_mat_case capped = { GGML_TYPE_F16, 512, 128, 513 };
-    check(!probe_claim(qnn, capped), "512x128 N=513 refused: padded input reaches GGML_QNN_IO_MAX_KB");
+    check(!probe_claim(qnn, capped), "512x128 N=513 refused: padded input reaches GGML_QNN_IO_MAX_KB=1024, set, which caps fp16 graph IO too");
 
     // probe/free/reacquire: llama frees all backends between model probe and context creation;
     // the backend must survive the cycle and still compute
@@ -660,10 +691,10 @@ static int scenario_budget(void) {
     ggml_backend_t qnn = qnn_backend_init_checked();
 
     // f16 weight of 4 MiB against a 1 MiB budget: refused as policy, never denylisted. main
-    // sets GGML_QNN_NPAD=64 so the padded IO (in 512 KiB, out 256 KiB) stays under
-    // GGML_QNN_IO_MAX_KB: the refusal is then the budget's alone, and a deleted budget gate
-    // shows up as a clean claim here rather than as an IO-size wedge at the validation
-    // execute, which sits out the execute watchdog (GGML_QNN_TIMEOUT_MS, 15 s by default)
+    // sets GGML_QNN_NPAD=64 so the padded IO (in 512 KiB, out 256 KiB) stays under even a
+    // 1 MiB GGML_QNN_IO_MAX_KB (unset, the cap does not cover this fp16-IO graph at all): the
+    // refusal is then the budget's alone, and a deleted budget gate shows up as a clean claim
+    // of a small graph here rather than as a 2 MiB validation execute at the 512 bucket
     const mul_mat_case big = { GGML_TYPE_F16, 2048, 1024, 64 };
     check(!probe_claim(qnn, big), "over-budget weight is refused");
 
@@ -745,9 +776,9 @@ static int scenario_denylist_probe(void) {
 
 static int scenario_denylist(bool noopt) {
     printf("scenario: denylist%s\n", noopt ? " (GGML_QNN_NO_OPT=1)" : "");
-    // main() seeded the file with:
-    //   MUL_MAT_f16_f32_256x128x1x1_256x512x1x1_s    (static variant of case A)
-    //   MUL_MAT_f16_f32_256x64x1x1_256x512x1x1_dyn   (dynamic variant of case B)
+    // main() seeded the file with the header line the backend writes, then:
+    //   MUL_MAT_f16_f32_256x128x1x1_256x512x1x1_io16_s    (static variant of case A)
+    //   MUL_MAT_f16_f32_256x64x1x1_256x512x1x1_io16_dyn   (dynamic variant of case B)
     ggml_backend_t qnn = qnn_backend_init_checked();
     ggml_backend_dev_t dev = ggml_backend_get_device(qnn);
 
@@ -790,9 +821,11 @@ static int scenario_denylist(bool noopt) {
     return g_failures ? 1 : 0;
 }
 
-// the padded-IO size law: static-bake graphs hang at execute when a padded IO buffer crosses
-// a runtime-dependent threshold (~1.5MB out on QAIRT 2.34, lower on 2.45), and work at any
-// weight size below it. this mode guards the WORKING side and is safe to gate on:
+// the padded-IO size law: on the mixed-dtype path (fp32 graph IO for an fp16 weight, now
+// GGML_QNN_NO_F16_IO) static-bake graphs hung at execute when a padded IO buffer crossed a
+// runtime-dependent threshold (~1.5MB out on QAIRT 2.34, lower on 2.45), and worked at any
+// weight size below it; fp16 graph IO ran far past it (bigstatic, 2026-09-27). this mode
+// guards the WORKING side on either path and is safe to gate on:
 // model-scale bake at a small pad bucket + correctness across bucket boundaries.
 // the optional npad argument (main) feeds GGML_QNN_NPAD; "0" pins the exact-pow2 branch
 static int scenario_modelscale(void) {
@@ -1042,10 +1075,12 @@ static int scenario_disable(void) {
 }
 
 // default-env gate: with GGML_QNN_MIN_DIM unset (default 32), small matmuls must be refused
-// (they are memory-bound and belong on the CPU) while normal shapes are still claimed
+// (they are memory-bound and belong on the CPU) while normal shapes are still claimed.
+// the IO cap's default is pinned here too, since this is the mode that runs at default env
 static int scenario_mindim(void) {
     printf("scenario: mindim (default env)\n");
     ggml_backend_t qnn = qnn_backend_init_checked();
+    ggml_backend_t cpu = cpu_backend_init();
 
     const mul_mat_case small = { GGML_TYPE_F16, 16, 16, 8 };
     check(!probe_claim(qnn, small), "16x16 matmul refused at the default min-dim gate");
@@ -1060,7 +1095,28 @@ static int scenario_mindim(void) {
     const mul_mat_case n32 = { GGML_TYPE_F16, 256, 256, 32 };
     check(probe_claim(qnn, n32), "256x256 N=32 claimed: exactly the default GGML_QNN_MIN_DIM");
 
+    // GGML_QNN_IO_MAX_KB unset caps only the graphs whose IO is 4 bytes per element. an F16
+    // weight's graph IO is fp16: 512x2560 at N=64 pads to the default 512 bucket, 512 KiB in
+    // and 2.5 MiB out, and must be claimed and compute correctly (the shape bigstatic ran at
+    // GGML_QNN_NPAD=512 on 2026-09-27: 2621440 bytes written, validation execute 3.2 ms).
+    // before the default changed, the 1 MiB cap refused it
+    const mul_mat_case wide16 = { GGML_TYPE_F16, 512, 2560, 64 };
+    bool claimed = false;
+    std::vector<float> got, ref;
+    const bool ok_q = run_mul_mat(qnn, wide16, got, &claimed);
+    const bool ok_c = run_mul_mat(cpu, wide16, ref);
+    const double e  = claimed && ok_q && ok_c ? nmse(ref, got) : -1.0;
+    char msg[224];
+    snprintf(msg, sizeof(msg), "F16 512x2560 N=64 claimed and matches CPU (nmse %.2e): 2.5 MiB of fp16 padded output, uncapped with GGML_QNN_IO_MAX_KB unset", e);
+    check(claimed && ok_q && ok_c && e >= 0.0 && e < 5e-4, msg);
+
+    // fp32 graph IO keeps the default 1 MiB cap: an F32 512x128 weight at the same bucket is
+    // exactly 1 MiB in, a policy refusal taken before graphCreate
+    const mul_mat_case f32_capped = { GGML_TYPE_F32, 512, 128, 64 };
+    check(!probe_claim(qnn, f32_capped), "F32 512x128 N=64 refused: 1 MiB of fp32 padded input reaches the default GGML_QNN_IO_MAX_KB");
+
     ggml_backend_free(qnn);
+    ggml_backend_free(cpu);
     return g_failures ? 1 : 0;
 }
 
@@ -1225,6 +1281,9 @@ static void check_form_refusals(ggml_backend_t qnn) {
     ggml_tensor * d_xv   = ggml_mul_mat(ctx, w, ggml_view_2d(ctx, xwide, K, N, xwide->nb[1], 0));
     ggml_tensor * d_bf16 = ggml_mul_mat(ctx, wbf16, x);
     ggml_tensor * d_xh   = ggml_mul_mat(ctx, w, xh);
+    // a weight computed in the graph, like mean pooling's cont(transpose(inp)): resident in the
+    // untagged buffer, so a regressed gate would build a dynamic graph
+    ggml_tensor * d_cont = ggml_mul_mat(ctx, ggml_cont(ctx, w), x);
     ggml_tensor * d_ctl  = ggml_mul_mat(ctx, w, x);
 
     ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, qnn);
@@ -1240,6 +1299,7 @@ static void check_form_refusals(ggml_backend_t qnn) {
     check(!ggml_backend_dev_supports_op(dev, d_xv),   "non-contiguous activation (strided view) refused: its nbytes would overrun the padded input");
     check(!ggml_backend_dev_supports_op(dev, d_bf16), "BF16 weight refused: a raw copy into an fp16 tensor would reinterpret its bits");
     check(!ggml_backend_dev_supports_op(dev, d_xh),   "F16 activation refused: the input tensor is declared F32");
+    check(!ggml_backend_dev_supports_op(dev, d_cont), "computed weight (cont) refused: a K that follows the ubatch would build a graph per K");
     check(ggml_backend_dev_supports_op(dev, d_ctl),   "control: the same F32 2D contiguous matmul is claimed");
 
     ggml_backend_buffer_free(buf);
@@ -1351,7 +1411,7 @@ static int scenario_loadprobe(void) {
     // CPU, it fails the graph (mean pooling over 32 sequences returned -3 from llama_encode).
     // a buffer-less graph matmul carries its real N. main pins GGML_QNN_NPAD=512, so N=32 pads
     // to 512 and the padded IO is K * 512 * 4 in, M * 512 * 4 out against the strict 1 MiB
-    // default of GGML_QNN_IO_MAX_KB:
+    // GGML_QNN_IO_MAX_KB main sets (the default, unset, would cap these F32 cases the same):
     //   F32 K=1024 M=1024 N=32: 2 MiB in and out -> refused
     //   F32 K=80   M=64   N=32: 160 KiB in, 128 KiB out -> claimed
     // and each verdict must match the same matmul resident in an untagged buffer, which is
@@ -1366,16 +1426,21 @@ static int scenario_loadprobe(void) {
     check(probe_claim(qnn, small, /*tag_weights=*/false), "and the same matmul resident in an untagged buffer is claimed too");
 
     // a weight probed for PLACEMENT carries a fictitious N (llama probes with its own batch),
-    // so the cap is evaluated at the smallest bucket, ggml_qnn_pad_n(1) = 512 here: K=1024 is
-    // 2 MiB in at any N the weight will ever run at, and claiming it would cost the weight its
+    // so the cap is evaluated at the smallest bucket, ggml_qnn_pad_n(1) = 512 here. an F16
+    // weight's graph IO is fp16, 2 bytes per element: K=1024 is 1 MiB in, at the strict cap,
+    // at any N the weight will ever run at, and claiming it would cost the weight its
     // CPU_REPACK placement for a node that never reaches the NPU. the probe's own N must not
-    // decide: 256x128 at N=513 would pad to 1024 (exactly 1 MiB in) and is still placed
+    // decide: 512x128 at N=513 would pad to 1024 (exactly 1 MiB in) and is still placed, as it
+    // is 512 KiB at the smallest bucket. (at 4 bytes per element that pair was 256x128; at 2 it
+    // fits at both buckets and could not tell them apart). both need the cap SET, as main does:
+    // unset, it covers fp32 graph IO only, so neither F16 weight is capped at any bucket: the
+    // first check would fail and the second pass without testing the bucket choice at all
     const mul_mat_case placed_capped = { GGML_TYPE_F16, 1024, 128, 64 };
     check(!probe_unallocated(dev, placed_capped, /*with_dummy=*/true),
           "F16 1024x128 weight refused at placement: capped even at the smallest bucket");
-    const mul_mat_case placed_n513 = { GGML_TYPE_F16, 256, 128, 513 };
+    const mul_mat_case placed_n513 = { GGML_TYPE_F16, 512, 128, 513 };
     check(probe_unallocated(dev, placed_n513, /*with_dummy=*/true),
-          "F16 256x128 weight placed whatever the probe's N: the cap is taken at the smallest bucket");
+          "F16 512x128 weight placed whatever the probe's N: the cap is taken at the smallest bucket");
 
     ggml_backend_free(qnn);
     // the unallocated probes must answer from policy alone and build nothing. what builds:
@@ -1595,11 +1660,13 @@ static int scenario_fault(void) {
 
 // the proven-shape rule: once a static shape has finalized and validated in the session, a
 // build failure on another weight of that shape is the HTP running out of mappable weight
-// memory (seen once at about 1170 MiB committed on QAIRT 2.45, on a loaded machine, with
-// error codes that are not memory-specific), not a verdict on the shape. main sets GGML_QNN_FAIL_EXECUTE to the shape
-// and GGML_QNN_FAIL_EXECUTE_SKIP=1, so the first weight builds for real and the second one
-// takes the injected validation-execute failure. unlimited: main sets GGML_QNN_STATIC_BUDGET_MB=0,
-// and the clamp must still replace that 0 (which means unlimited) with the committed bytes
+// memory, not a verdict on the shape. on QAIRT 2.45 that came at about 1170 MiB committed on
+// a machine loaded with other work (2026-09-16, error codes that are not memory-specific) and
+// at 1830.0 MiB on a near-idle one with the budget lifted (2026-09-26). main sets
+// GGML_QNN_FAIL_EXECUTE to the shape and GGML_QNN_FAIL_EXECUTE_SKIP=1, so the first weight
+// builds for real and the second one takes the injected validation-execute failure.
+// unlimited: main sets GGML_QNN_STATIC_BUDGET_MB=0, and the clamp must still replace that 0
+// (which means unlimited) with the committed bytes
 static int scenario_clamp(bool unlimited) {
     printf("scenario: clamp (GGML_QNN_FAIL_EXECUTE=%s, SKIP=1%s)\n", getenv("GGML_QNN_FAIL_EXECUTE"),
            unlimited ? ", GGML_QNN_STATIC_BUDGET_MB=0" : "");
@@ -1656,9 +1723,11 @@ static int scenario_clamp(bool unlimited) {
     return g_failures ? 1 : 0;
 }
 
-// the fault-hook modes below (GGML_QNN_DELAY_EXECUTE, GGML_QNN_FAIL_FINALIZE) run F32 weights
+// the fault-hook modes below (GGML_QNN_DELAY_EXECUTE, GGML_QNN_FAIL_FINALIZE, and in
+// compute-error and reinit-fail GGML_QNN_FAIL_EXECUTE and GGML_QNN_FAIL_INIT) run F32 weights
 // at GGML_QNN_NPAD=64 only: F32-weight executes of these shapes took a few ms on the dev box
-// even under load, while fp16-weight ones took seconds there. the limits also cover
+// even under load, while fp16-weight ones took seconds there on the mixed-dtype path that
+// fp16 graph IO (ggml_qnn_graph::f16_io) has since replaced. the limits also cover
 // the first executes of each process, whose cost nothing measures, so they sit at 500 ms and
 // 1 s, and every injected delay clears its limit by 3x or more
 // A, B and C are distinct shapes, so a hook keyed on one never matches another
@@ -1820,9 +1889,12 @@ static int scenario_validate_timeout(bool cold) {
 }
 
 // compute-time execute timeout: main sets GGML_QNN_NO_PREVALIDATE=1, GGML_QNN_TIMEOUT_MS to
-// g_timeout_ms and delays A's first compute by g_timeout_delay. the node fails, the graph is demoted and the session
-// hard-degrades: the same and a new shape are refused, a second compute fails before any
-// execute, and with no fast validation ever seen the shape is not persisted
+// g_timeout_ms and delays A's first compute by g_timeout_delay. the node fails, the graph is
+// demoted and the session hard-degrades: the same and a new shape are refused, and a second
+// compute fails before any execute. B, built before the timeout, fails too: the demotion
+// alone already fails A again, so B is what tells a hard degrade from slow_only, under which
+// B's cached graph would still run. with no fast validation ever seen the shape is not
+// persisted. B's key lacks A's GGML_QNN_DELAY_EXECUTE substring, so nothing delays it
 static int scenario_compute_timeout(void) {
     printf("scenario: compute-timeout (GGML_QNN_NO_PREVALIDATE=1, GGML_QNN_TIMEOUT_MS=%d, A's first compute delayed %d ms)\n", g_timeout_ms, g_timeout_delay);
     const char * dl = getenv("GGML_QNN_DENYLIST");
@@ -1833,6 +1905,9 @@ static int scenario_compute_timeout(void) {
     held_init(a, qnn, g_hook_a);
     const bool claimed_a = held_claimed(qnn, a);
     check(claimed_a, "A claimed without a validation execute");
+    held_mul_mat b;
+    held_init(b, qnn, g_hook_b);
+    check(held_claimed(qnn, b), "B claimed without a validation execute");
 
     std::vector<float> got;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1848,17 +1923,69 @@ static int scenario_compute_timeout(void) {
 
     check(!held_claimed(qnn, a), "hard-degraded: the timed-out shape is refused too");
     check(!probe_claim(qnn, g_hook_c), "hard-degraded session refuses a new shape");
-    check(!held_compute(qnn, a, got), "a second compute of A fails: a hard degrade, not slow_only");
+    check(!held_compute(qnn, a, got), "a second compute of A fails before any execute");
+    check(!held_compute(qnn, b, got), "B, built before the timeout, fails without executing: a hard degrade, not slow_only");
     check(file_size(dl) < 0, "no healthy validation seen: the compute timeout is not persisted, denylist file not created");
 
+    held_free(b);
     held_free(a);
     ggml_backend_free(qnn); // degraded, so kept: the release flushes the counters
 
-    check_stat("graphs_created", 1, "A only");
-    // compute_node counts an execute that timed out; the second compute failed on the
+    check_stat("graphs_created", 2, "A and B; C refused before any build");
+    // compute_node counts an execute that timed out; A's second compute and B's failed on the
     // degraded session before reaching one
-    check_stat("exec_count", 1, "the timed-out compute; the second failed before any execute");
+    check_stat("exec_count", 1, "the timed-out compute; A's second and B's failed before any execute");
     print_marker("COMPUTE-TIMEOUT");
+    return g_failures ? 1 : 0;
+}
+
+// compute-time execute ERROR, the branch a real mid-decode failure (deferred prepare, device
+// memory) takes: main sets GGML_QNN_NO_PREVALIDATE=1 and GGML_QNN_FAIL_EXECUTE to A's shape key,
+// so A is claimed without a validation execute and its first compute gets an error return. the
+// node fails, the graph is demoted and the session hard-degrades. B, built before the failure,
+// fails too: the demotion alone already fails A again, so B is what tells a hard degrade from
+// slow_only, under which B's cached graph would still run. B's key lacks A's substring, so the
+// hook never fires for it. an error return is not a verdict on the shape, so nothing is
+// persisted, and a re-init keeps the degraded session
+static int scenario_compute_error(void) {
+    printf("scenario: compute-error (GGML_QNN_NO_PREVALIDATE=1, GGML_QNN_FAIL_EXECUTE=%s)\n", getenv("GGML_QNN_FAIL_EXECUTE"));
+    const char * dl = getenv("GGML_QNN_DENYLIST");
+    GGML_ASSERT(dl != nullptr);
+    ggml_backend_t qnn = qnn_backend_init_checked();
+
+    held_mul_mat a;
+    held_init(a, qnn, g_hook_a);
+    const bool claimed_a = held_claimed(qnn, a);
+    check(claimed_a, "A claimed without a validation execute");
+    held_mul_mat b;
+    held_init(b, qnn, g_hook_b);
+    check(held_claimed(qnn, b), "B claimed without a validation execute");
+
+    std::vector<float> got;
+    const bool ok1 = claimed_a && held_compute(qnn, a, got);
+    check(claimed_a && !ok1, "A's first compute gets the injected execute error and fails the node");
+
+    check(!held_claimed(qnn, a), "hard-degraded: the failed shape is refused too");
+    check(!probe_claim(qnn, g_hook_c), "hard-degraded session refuses a new shape");
+    check(!held_compute(qnn, a, got), "a second compute of A fails before any execute");
+    check(!held_compute(qnn, b, got), "B, built before the failure, fails without executing: a hard degrade, not slow_only");
+    check(file_size(dl) < 0, "an execute error return stays in-process: denylist file not created");
+
+    held_free(b);
+    held_free(a);
+    ggml_backend_free(qnn); // degraded, so kept: the release flushes the counters
+    ggml_backend_t qnn2 = qnn_backend_init();
+    check(qnn2 != nullptr, "backend init still succeeds after the degraded session was released");
+    if (qnn2) {
+        check(!probe_claim(qnn2, g_hook_b), "re-initialized backend still refuses shapes (degraded session kept)");
+        ggml_backend_free(qnn2);
+    }
+
+    check_stat("graphs_created", 2, "A and B; C and the re-init's probe refused before any build");
+    // compute_node counts the failed execute; A's second compute and B's failed on the degraded
+    // session before reaching one
+    check_stat("exec_count", 1, "the failed compute; A's second and B's failed before any execute");
+    print_marker("COMPUTE-ERROR");
     return g_failures ? 1 : 0;
 }
 
@@ -1928,6 +2055,75 @@ static int scenario_denylist_append(void) {
 
     ggml_backend_free(qnn); // not degraded: a clean session free, which writes the counters
     check_stat("graphs_created", 1, "B only");
+    return g_failures ? 1 : 0;
+}
+
+// a re-init that fails after a working session: llama-bench and --fit free and re-init the
+// session per context, and an init_backend that returned NULL made llama throw for the ACCEL
+// device instead of running on the CPU. main sets GGML_QNN_FAIL_INIT=1: init 1 (the registry's)
+// works, init 2 (after the free below) fails, and init 3 would work again, so a claim after the
+// failure would mean the latch was dropped and the session re-created.
+// qnn_backend_init goes through ggml_backend_dev_by_name, which serves the device the registry
+// cached at startup and never asks the backend again. ggml_backend_qnn_init asks it live
+// (get_device_count, then dev_init on device 0) and returns NULL at a count of 0, so that path
+// is walked too, with generic registry calls only so a GGML_BACKEND_DL build still links
+static int scenario_reinit_fail(void) {
+    printf("scenario: reinit-fail (GGML_QNN_FAIL_INIT=1)\n");
+    ggml_backend_t qnn = qnn_backend_init_checked();
+    ggml_backend_t cpu = cpu_backend_init();
+
+    std::vector<float> ref, got;
+    GGML_ASSERT(run_mul_mat(cpu, g_hook_a, ref));
+    bool claimed = false;
+    const bool ok = run_mul_mat(qnn, g_hook_a, got, &claimed);
+    check(claimed && ok && nmse(ref, got) < 5e-4, "the first session claims A, computes it and matches the CPU");
+    ggml_backend_free(qnn); // refs 1 -> 0 on a healthy session: freed, so the next init re-creates it
+
+    ggml_backend_t lost = qnn_backend_init();
+    check(lost != nullptr, "an init whose session re-init fails still returns a backend, so llama can fall back to the CPU");
+    if (lost) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(lost);
+        check(!probe_claim(lost, g_hook_a), "the backend without a session claims no resident matmul");
+        check(!probe_unallocated(dev, g_hook_a, /*with_dummy=*/true),  "nor a weight at placement (dummy buffer)");
+        check(!probe_unallocated(dev, g_hook_a, /*with_dummy=*/false), "nor a buffer-less graph matmul");
+        held_mul_mat h;
+        held_init(h, lost, g_hook_a);
+        check(!held_compute(lost, h, got), "a matmul computed on it anyway fails the graph, no session is touched");
+        held_free(h);
+        ggml_backend_free(lost);
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("QNN");
+    check(reg != nullptr, "the QNN registry entry is still found by name after the loss");
+    if (reg) {
+        const size_t n_dev = ggml_backend_reg_dev_count(reg);
+        check(n_dev == 1, "a lost session keeps its device, so ggml_backend_qnn_init still gets a backend");
+        // what ggml_backend_qnn_init does with that count: no device, no backend
+        ggml_backend_t via_reg = n_dev > 0 ? ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr) : nullptr;
+        check(via_reg != nullptr, "the registry path (live device count, dev_init on device 0) returns a backend");
+        if (via_reg) {
+            check(!probe_claim(via_reg, g_hook_a), "which claims no resident matmul either");
+            ggml_backend_free(via_reg);
+        }
+    }
+#ifndef GGML_BACKEND_DL
+    // the public entry point itself, linkable when the backends are not loaded as modules
+    ggml_backend_t via_init = ggml_backend_qnn_init();
+    check(via_init != nullptr, "ggml_backend_qnn_init() itself returns a backend after the loss");
+    if (via_init) {
+        check(!probe_claim(via_init, g_hook_a), "which claims no resident matmul either");
+        ggml_backend_free(via_init);
+    }
+#endif
+
+    ggml_backend_t again = qnn_backend_init();
+    check(again != nullptr, "a later init still returns a backend");
+    if (again) {
+        check(!probe_claim(again, g_hook_a), "the failure is latched: init 3 is not injected, yet nothing is claimed");
+        ggml_backend_free(again);
+    }
+
+    ggml_backend_free(cpu);
     return g_failures ? 1 : 0;
 }
 
@@ -2044,7 +2240,7 @@ static int scenario_reuse(void) {
     const std::vector<float> w_old   = held_weight(h);
     std::vector<float> w_new(w_old.size());
     fill_uniform(w_new, 4242);
-    // test wiring: the fingerprint samples the first and last 512 bytes, both must change
+    // test wiring: the new content must move the fingerprint; its first and last 512 bytes, which it reads, both change
     GGML_ASSERT(memcmp(w_old.data(), w_new.data(), 512) != 0);
     GGML_ASSERT(memcmp((const uint8_t *) w_old.data() + w_old.size() * sizeof(float) - 512,
                        (const uint8_t *) w_new.data() + w_new.size() * sizeof(float) - 512, 512) != 0);
@@ -2069,7 +2265,7 @@ static int scenario_reuse(void) {
 
 // GGML_QNN_NO_STATIC_WEIGHTS (set by main): a WEIGHTS-tagged weight goes the dynamic path,
 // where it is copied into the graph's IO buffer once and the copy is skipped while address and
-// content fingerprint still match. one graph (the key is the padded shape), four computes
+// content fingerprint still match. one graph (the key is the padded shape), five computes
 static int scenario_dyncache(void) {
     printf("scenario: dyncache (GGML_QNN_NO_STATIC_WEIGHTS=1)\n");
     ggml_backend_t qnn = qnn_backend_init_checked();
@@ -2088,30 +2284,58 @@ static int scenario_dyncache(void) {
     check(ok && nmse(ref_orig, got) < 5e-4, m);
 
     // the skip is invisible while the content really is unchanged. a WEIGHTS buffer is
-    // immutable by contract, and the fingerprint samples only nbytes and the first and last
-    // 512 bytes, so rewriting the bytes between them breaks the contract without moving the
-    // fingerprint: a compute that skips the copy still returns the ORIGINAL result, one that
-    // re-copied every time returns the new one. if the fingerprint ever covers the whole
-    // tensor, this check must flip to the rewritten content
-    const size_t n_edge = 512 / sizeof(float);
+    // immutable by contract, and the fingerprint reads only nbytes, the first and last 512
+    // bytes and 64 strided 8-byte samples (ggml_qnn_weight_fingerprint), so rewriting every
+    // other byte breaks the contract without moving the fingerprint: a compute that skips the
+    // copy still returns the ORIGINAL result, one that re-copied every time returns the new one
+    const size_t nbytes    = w_orig.size() * sizeof(float);
+    const size_t n_samples = 64;
+    const size_t stride    = nbytes / n_samples;
+    GGML_ASSERT(nbytes > 1024 && nbytes % n_samples == 0 && (stride / 2) % sizeof(float) == 0); // test wiring: samples are whole floats
+    auto sampled = [&](size_t i) {
+        const size_t b = i * sizeof(float);
+        return b < 512 || b >= nbytes - 512 || (b % stride >= stride / 2 && b % stride < stride / 2 + sizeof(uint64_t));
+    };
     std::vector<float> w_mid = w_orig;
     std::vector<float> fresh(w_mid.size());
     fill_uniform(fresh, 777);
-    for (size_t i = n_edge; i + n_edge < w_mid.size(); i++) {
-        w_mid[i] = fresh[i];
+    for (size_t i = 0; i < w_mid.size(); i++) {
+        if (!sampled(i)) {
+            w_mid[i] = fresh[i];
+        }
     }
     held_set_weight(h, w_mid);
     GGML_ASSERT(nmse(held_ref(h), ref_orig) > 0.1); // test wiring: the two results differ
     ok = held_compute(qnn, h, got);
-    snprintf(m, sizeof(m), "the copy was skipped: edges and address unchanged, the cached copy served (nmse %.2e vs the original)",
+    snprintf(m, sizeof(m), "the copy was skipped: sampled bytes and address unchanged, the cached copy served (nmse %.2e vs the original)",
              ok ? nmse(ref_orig, got) : -1.0);
     check(ok && nmse(ref_orig, got) < 5e-4, m);
 
-    // a real content change at the same address moves the fingerprint: the weight is copied again
+    // new content between an unchanged head and tail moves the strided samples: copied again.
+    // before the samples, a weight that shared its first and last 512 bytes aliased the old copy
+    std::vector<float> w_body = w_mid;
+    fill_uniform(fresh, 778);
+    for (size_t i = 0; i < w_body.size(); i++) {
+        const size_t b = i * sizeof(float);
+        if (b >= 512 && b < nbytes - 512) {
+            w_body[i] = fresh[i];
+        }
+    }
+    held_set_weight(h, w_body);
+    const std::vector<float> ref_body = held_ref(h);
+    GGML_ASSERT(nmse(ref_body, ref_orig) > 0.1); // test wiring: the stale copy would be told apart
+    ok = held_compute(qnn, h, got);
+    snprintf(m, sizeof(m), "new content with the same head and tail is copied again and matches it (nmse %.2e)", ok ? nmse(ref_body, got) : -1.0);
+    check(ok && nmse(ref_body, got) < 5e-4, m);
+
+    // a real content change at the same address, head and tail included, moves the fingerprint:
+    // the weight is copied again
     std::vector<float> w_new(w_orig.size());
     fill_uniform(w_new, 4243);
-    GGML_ASSERT(memcmp(w_new.data(), w_mid.data(), 512) != 0);
-    GGML_ASSERT(memcmp(w_new.data() + w_new.size() - n_edge, w_mid.data() + w_mid.size() - n_edge, 512) != 0);
+    const uint8_t * nb = (const uint8_t *) w_new.data();
+    const uint8_t * ob = (const uint8_t *) w_body.data();
+    GGML_ASSERT(memcmp(nb, ob, 512) != 0);
+    GGML_ASSERT(memcmp(nb + nbytes - 512, ob + nbytes - 512, 512) != 0);
     held_set_weight(h, w_new);
     const std::vector<float> ref_new = held_ref(h);
     ok = held_compute(qnn, h, got);
@@ -2123,8 +2347,8 @@ static int scenario_dyncache(void) {
 
     check_stat("weights_baked", 0, "no static bake with GGML_QNN_NO_STATIC_WEIGHTS");
     check_stat("graphs_created", 1, "one dynamic graph: its key is the padded shape, no weight identity");
-    check_stat("graph_cache_hits", 4, "the claim created the graph, each of the four computes found it");
-    check_stat("exec_count", 4, "one execute per compute");
+    check_stat("graph_cache_hits", 5, "the claim created the graph, each of the five computes found it");
+    check_stat("exec_count", 5, "one execute per compute");
     return g_failures ? 1 : 0;
 }
 
@@ -2164,20 +2388,27 @@ static int scenario_quantized(void) {
 // main sets malformed values: GGML_QNN_NPAD=abc, GGML_QNN_MIN_DIM=-5 (below its floor of 1),
 // GGML_QNN_IO_MAX_KB=12k (a partial number). each must fall back to its default, with a warning,
 // rather than take a partial parse: 12k read as 12 would refuse every matmul, abc read as 0
-// would move every graph to the exact-pow2 bucket
+// would move every graph to the exact-pow2 bucket. for the cap the default is also a scope: a
+// malformed value counts as unset, so it caps fp32 graph IO only, not the fp16 IO a set value
+// would cap too
 static int scenario_envparse(void) {
     printf("scenario: envparse (GGML_QNN_NPAD=abc, GGML_QNN_MIN_DIM=-5, GGML_QNN_IO_MAX_KB=12k)\n");
     ggml_backend_t qnn = qnn_backend_init_checked();
 
     const mul_mat_case rows16 = { GGML_TYPE_F32, 256, 128, 16 };
     check(!probe_claim(qnn, rows16), "N=16 refused: the default GGML_QNN_MIN_DIM of 32 applies");
-    // padded to the default 512 bucket: 512 KiB in, 256 KiB out, under the default 1 MiB cap
+    // padded to the default 512 bucket: 512 KiB in, 256 KiB out, under the default 1 MiB cap,
+    // which covers this F32 weight's fp32 graph IO
     const mul_mat_case under = { GGML_TYPE_F32, 256, 128, 64 };
     check(probe_claim(qnn, under), "256x128 N=64 claimed: 512 KiB of padded IO is under the default GGML_QNN_IO_MAX_KB");
+    // an F16 weight at the same bucket: fp16 graph IO, 1 MiB in, which a set 1024 (or the 12
+    // of a partial parse) refuses and the unset default does not cover
+    const mul_mat_case f16_1mib = { GGML_TYPE_F16, 1024, 128, 64 };
+    check(probe_claim(qnn, f16_1mib), "F16 1024x128 N=64 claimed: 12k counts as unset, and the unset cap does not cover fp16 graph IO");
 
     ggml_backend_free(qnn);
-    check_stat("graphs_created", 1, "the claimed case only, the N=16 one was refused before any build");
-    check_stat("pad_n_last", 512, "the claimed case landed on the default bucket 512");
+    check_stat("graphs_created", 2, "the two claimed cases only, the N=16 one was refused before any build");
+    check_stat("pad_n_last", 512, "the claimed cases landed on the default bucket 512");
     return g_failures ? 1 : 0;
 }
 
@@ -2189,11 +2420,11 @@ int main(int argc, char ** argv) {
     const bool uses_dl = mode == "budget" || mode == "denylist" || mode == "denylist-probe" || mode == "watchdog" ||
                          mode == "fault" || mode == "clamp" ||
                          mode == "slow-validate" || mode == "validate-timeout" || mode == "compute-timeout" ||
-                         mode == "finalize-error" || mode == "denylist-append";
+                         mode == "compute-error" || mode == "finalize-error" || mode == "denylist-append";
     // these leave a degraded session behind on purpose (the timeout ones also an abandoned
     // worker), so they end through hard_exit and never reach DLL detach
     const bool keeps_degraded = mode == "watchdog" || mode == "fault" || mode == "slow-validate" || mode == "slow-compute" ||
-                                mode == "validate-timeout" || mode == "compute-timeout";
+                                mode == "validate-timeout" || mode == "compute-timeout" || mode == "compute-error";
 
     // every mode starts from the backend's defaults, whatever the caller's shell exports: an
     // inherited GGML_QNN_NPAD=64 moved the hard-coded 512-bucket shape keys, GGML_QNN_DISABLE
@@ -2201,7 +2432,8 @@ int main(int argc, char ** argv) {
     // backend reads (getenv and ggml_qnn_env_ll in ggml/src/ggml-qnn), except GGML_QNN_DEBUG,
     // which only raises the QNN log level. kept: the variable the ctest variant exists for
     // (its ENVIRONMENT property, named by argv or fixed by the mode), and for the two modes a
-    // caller tunes on purpose their limits (bigstatic also its bucket and IO cap)
+    // caller tunes on purpose their limits and the IO dtype lever GGML_QNN_NO_F16_IO (bigstatic
+    // also its bucket and IO cap)
     const char * keep_env = mode == "modelscale" && argc > 3 ? argv[3]
                           : mode == "elementwise-on"         ? "GGML_QNN_ELEMENTWISE"
                                                              : nullptr;
@@ -2216,13 +2448,15 @@ int main(int argc, char ** argv) {
         "GGML_QNN_NO_PREVALIDATE",    "GGML_QNN_NO_STATIC_WEIGHTS", "GGML_QNN_NPAD",
         "GGML_QNN_QUANTIZED",         "GGML_QNN_SHARED_MEM",        "GGML_QNN_SLOW_EXEC_MS",
         "GGML_QNN_STATIC_BUDGET_MB",  "GGML_QNN_STATS",             "GGML_QNN_TIMEOUT_MS",
+        "GGML_QNN_FAIL_INIT",         "GGML_QNN_HTP_ARCH",          "GGML_QNN_NO_F16_IO",
+        "GGML_QNN_SOC_MODEL",
     };
     for (const char * name : backend_env) {
         if (keep_env && strcmp(name, keep_env) == 0) {
             continue;
         }
         if (tuned && (strcmp(name, "GGML_QNN_SLOW_EXEC_MS") == 0 || strcmp(name, "GGML_QNN_TIMEOUT_MS") == 0 ||
-                      strcmp(name, "GGML_QNN_BUILD_TIMEOUT_MS") == 0)) {
+                      strcmp(name, "GGML_QNN_BUILD_TIMEOUT_MS") == 0 || strcmp(name, "GGML_QNN_NO_F16_IO") == 0)) {
             continue;
         }
         if (mode == "bigstatic" && (strcmp(name, "GGML_QNN_NPAD") == 0 || strcmp(name, "GGML_QNN_IO_MAX_KB") == 0)) {
@@ -2239,11 +2473,15 @@ int main(int argc, char ** argv) {
     if (mode == "basic") {
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_NPAD", "512"); // the scenario's shapes are laid out around this bucket
+        // set, so the cap covers fp16 graph IO too: the scenario's refusal is an fp16-IO graph
+        set_env("GGML_QNN_IO_MAX_KB", "1024");
     } else if (mode == "bigstatic") {
         set_env("GGML_QNN_MIN_DIM", "1");
         // the diagnostic exists to reach the padded-IO hang thresholds that GGML_QNN_IO_MAX_KB
-        // now refuses ahead of time (every 512-class case is exactly 1 MiB in at the default
-        // bucket); lift the cap unless the caller set one
+        // refuses ahead of time. unset, the cap no longer covers these fp16-IO cases, but a
+        // caller's GGML_QNN_NO_F16_IO makes their IO fp32 (every 512-class case is then exactly
+        // 1 MiB in at the default bucket) and the default caps that: lift it unless the caller
+        // set one
         if (!getenv("GGML_QNN_IO_MAX_KB")) {
             set_env("GGML_QNN_IO_MAX_KB", "1048576");
         }
@@ -2261,7 +2499,7 @@ int main(int argc, char ** argv) {
         enable_stats();
         set_env("GGML_QNN_STATIC_BUDGET_MB", "1");
         set_env("GGML_QNN_DENYLIST", dl_path);
-        set_env("GGML_QNN_NPAD", "64"); // keeps the over-budget probe under the IO cap, see the scenario
+        set_env("GGML_QNN_NPAD", "64"); // keeps the over-budget probe's IO small, see the scenario
     } else if (mode == "denylist-probe") {
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_DENYLIST", dl_path);
@@ -2272,9 +2510,10 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "cannot create %s\n", dl_path);
             return 1;
         }
-        // byte-for-byte what a real run at this bucket persists - N is 32, NOT the 512 the
-        // placement probe arrives with
-        fprintf(f, "MUL_MAT_f16_f32_256x128x1x1_256x32x1x1_s\n");
+        // byte-for-byte what a real run at this bucket persists, header line included - N is
+        // 32, NOT the 512 the placement probe arrives with
+        fprintf(f, "# ggml-qnn denylist v1\n");
+        fprintf(f, "MUL_MAT_f16_f32_256x128x1x1_256x32x1x1_io16_s\n");
         fclose(f);
     } else if (mode == "denylist") {
         // argv[2] "noopt": file entries are advisory under GGML_QNN_NO_OPT
@@ -2293,11 +2532,14 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "cannot create %s\n", dl_path);
             return 1;
         }
-        // byte-for-byte the backend's shape-key format (ggml_qnn_shape_key): both variants
-        // carry the PADDED N (60 -> 512 at the pinned bucket); the static graph key's weight
-        // suffix is not part of the shape key
-        fprintf(f, "MUL_MAT_f16_f32_256x128x1x1_256x512x1x1_s\n");
-        fprintf(f, "MUL_MAT_f16_f32_256x64x1x1_256x512x1x1_dyn\n");
+        // byte-for-byte what the backend writes (ggml_qnn_denylist_append): the header line the
+        // loader must skip, then shape keys (ggml_qnn_shape_key). both variants carry the PADDED
+        // N (60 -> 512 at the pinned bucket) and the fp16-IO tag of an f16 weight; the static
+        // graph key's weight suffix is not part of the shape key. check_denylist_holds pins the
+        // writer to the same bytes, so reader and writer agree on the file
+        fprintf(f, "# ggml-qnn denylist v1\n");
+        fprintf(f, "MUL_MAT_f16_f32_256x128x1x1_256x512x1x1_io16_s\n");
+        fprintf(f, "MUL_MAT_f16_f32_256x64x1x1_256x512x1x1_io16_dyn\n");
         fclose(f);
     } else if (mode == "watchdog") {
         remove(dl_path);
@@ -2343,6 +2585,9 @@ int main(int argc, char ** argv) {
         enable_stats();
         // the default, pinned because the scenario's IO-cap cases are computed for this bucket
         set_env("GGML_QNN_NPAD", "512");
+        // set, so the cap covers fp16 graph IO too: the placement cases are F16 weights, and
+        // unset the cap would not refuse them at any bucket
+        set_env("GGML_QNN_IO_MAX_KB", "1024");
     } else if (mode == "elementwise-on") {
         enable_stats();
         set_env("GGML_QNN_MIN_ELEMENTS", "65536"); // keeps the ADD trial at 256 KiB IO, see the scenario
@@ -2397,6 +2642,13 @@ int main(int argc, char ** argv) {
         set_env("GGML_QNN_TIMEOUT_MS", std::to_string(g_timeout_ms).c_str());
         set_env("GGML_QNN_DELAY_EXECUTE", shape_key(g_hook_a, g_hook_npad, /*is_static=*/true).c_str());
         set_env("GGML_QNN_DELAY_EXECUTE_MS", std::to_string(g_timeout_delay).c_str());
+    } else if (mode == "compute-error") {
+        remove(dl_path);
+        enable_stats();
+        set_env("GGML_QNN_DENYLIST", dl_path);
+        set_env("GGML_QNN_NPAD", std::to_string(g_hook_npad).c_str());
+        set_env("GGML_QNN_NO_PREVALIDATE", "1");
+        set_env("GGML_QNN_FAIL_EXECUTE", shape_key(g_hook_a, g_hook_npad, /*is_static=*/true).c_str());
     } else if (mode == "finalize-error") {
         remove(dl_path);
         enable_stats();
@@ -2419,6 +2671,10 @@ int main(int argc, char ** argv) {
         }
         fputs(g_append_seed, f);
         fclose(f);
+    } else if (mode == "reinit-fail") {
+        set_env("GGML_QNN_NPAD", std::to_string(g_hook_npad).c_str());
+        // the registry's session init is the first; the re-init after the scenario's free fails
+        set_env("GGML_QNN_FAIL_INIT", "1");
     } else if (mode == "reuse") {
         enable_stats();
         set_env("GGML_QNN_NPAD", std::to_string(g_hook_npad).c_str());
@@ -2439,7 +2695,8 @@ int main(int argc, char ** argv) {
     } else {
         fprintf(stderr, "unknown mode %s (basic|budget|denylist [noopt]|watchdog|fault|clamp [unlimited]|bigstatic|modelscale|health|"
                         "disable|mindim|rebake|elementwise|elementwise-on|loadprobe|slow-validate|slow-compute|validate-timeout [cold]|"
-                        "compute-timeout|finalize-error|denylist-append|denylist-probe|reuse|dyncache|quantized|envparse)\n", mode.c_str());
+                        "compute-timeout|compute-error|finalize-error|denylist-append|reinit-fail|denylist-probe|reuse|dyncache|quantized|"
+                        "envparse)\n", mode.c_str());
         return 1;
     }
 
@@ -2518,10 +2775,14 @@ int main(int argc, char ** argv) {
         rc = scenario_validate_timeout(argc > 2);
     } else if (mode == "compute-timeout") {
         rc = scenario_compute_timeout();
+    } else if (mode == "compute-error") {
+        rc = scenario_compute_error();
     } else if (mode == "finalize-error") {
         rc = scenario_finalize_error();
     } else if (mode == "denylist-append") {
         rc = scenario_denylist_append();
+    } else if (mode == "reinit-fail") {
+        rc = scenario_reinit_fail();
     } else if (mode == "reuse") {
         rc = scenario_reuse();
     } else if (mode == "dyncache") {

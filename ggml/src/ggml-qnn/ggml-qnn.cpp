@@ -5,6 +5,7 @@
 
 #include "qnn-lib.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -31,16 +32,31 @@ static ggml_qnn_session * ggml_backend_qnn_session_acquire(bool add_ref) {
         ggml_qnn_session_ptr = ggml_qnn_session_init();
         if (ggml_qnn_session_ptr) {
             ggml_qnn_session_worked = true;
-        } else if (!ggml_qnn_session_worked) {
-            // no HTP on this machine, stop probing. a failure after a successful run is
-            // not latched, so a transient error can be retried on the next acquire
+        } else {
+            // latched: with no HTP on this machine there is nothing to probe for, and a re-init
+            // that fails after a successful session (another process holds the HTP, or it is
+            // wedged) is not retried either, a retry can hang unwatchdogged in deviceCreate.
+            // after a success, init_backend then returns a backend that claims nothing, so
+            // llama-bench and --fit, which re-init per context, fall back to the CPU
             ggml_qnn_session_failed = true;
+            if (ggml_qnn_session_worked) {
+                // stderr, like the first degrade: llama-bench without -v drops the logger
+                fprintf(stderr, "ggml-qnn: the NPU session could not be re-created, claiming no ops for the rest of this process: "
+                                "everything runs on the CPU from here\n");
+                fflush(stderr);
+            }
         }
     }
     if (ggml_qnn_session_ptr && add_ref) {
         ggml_qnn_session_refs++;
     }
     return ggml_qnn_session_ptr;
+}
+
+// the session worked once in this process and a later re-init failed, see the latch above
+static bool ggml_backend_qnn_session_lost(void) {
+    std::lock_guard<std::mutex> lock(ggml_qnn_session_mutex);
+    return ggml_qnn_session_failed && ggml_qnn_session_worked;
 }
 
 static void ggml_backend_qnn_session_release(void) {
@@ -62,12 +78,12 @@ static void ggml_backend_qnn_session_release(void) {
     }
 }
 
-// whether the shared session has degraded; false when there is no session. the unallocated
-// probe in supports_op consults this without acquiring a session, so a wedged NPU stops
-// claiming weights at model load and not only at schedule time
+// whether the shared session has degraded, or can no longer be created (the latch in acquire).
+// the unallocated probe in supports_op consults this without acquiring a session, so a wedged
+// or lost NPU stops claiming weights at model load and not only at schedule time
 static bool ggml_backend_qnn_session_degraded(void) {
     std::lock_guard<std::mutex> lock(ggml_qnn_session_mutex);
-    return ggml_qnn_session_ptr && ggml_qnn_session_ptr->degraded.load();
+    return ggml_qnn_session_failed || (ggml_qnn_session_ptr && ggml_qnn_session_ptr->degraded.load());
 }
 
 // backend interface
@@ -79,12 +95,15 @@ static const char * ggml_backend_qnn_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_qnn_free(ggml_backend_t backend) {
-    ggml_backend_qnn_session_release();
+    // a backend made after the session was lost holds no ref, see init_backend
+    if (backend->context) {
+        ggml_backend_qnn_session_release();
+    }
     delete backend;
 }
 
 static enum ggml_status ggml_backend_qnn_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    ggml_qnn_session * sess = (ggml_qnn_session *) backend->context;
+    ggml_qnn_session * sess = (ggml_qnn_session *) backend->context; // NULL once the session is lost
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -97,6 +116,9 @@ static enum ggml_status ggml_backend_qnn_graph_compute(ggml_backend_t backend, s
             case GGML_OP_MUL_MAT:
             case GGML_OP_ADD:
             case GGML_OP_MUL:
+                if (!sess) {
+                    return GGML_STATUS_FAILED;
+                }
                 try {
                     if (ggml_qnn_compute_node(sess, node) != GGML_STATUS_SUCCESS) {
                         return GGML_STATUS_FAILED;
@@ -194,7 +216,9 @@ static void ggml_backend_qnn_device_get_props(ggml_backend_dev_t dev, struct ggm
 
 static ggml_backend_t ggml_backend_qnn_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     ggml_qnn_session * sess = ggml_backend_qnn_session_acquire(/*add_ref=*/true);
-    if (!sess) {
+    // a lost session still gets a backend, with no context: it claims nothing, and llama
+    // throws for an ACCEL device whose init returns NULL instead of falling back to the CPU
+    if (!sess && !ggml_backend_qnn_session_lost()) {
         return NULL;
     }
 
@@ -246,6 +270,13 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
                 return false;
             }
             if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+                return false;
+            }
+            // src0 must be a leaf (a weight, a LoRA tensor) or a view of one. one computed in the
+            // graph (mean pooling's cont(transpose(inp))) has a K that follows the ubatch, and
+            // every new K builds a graph that is never freed
+            const struct ggml_tensor * base0 = src0->view_src ? src0->view_src : src0;
+            if (base0->op != GGML_OP_NONE) {
                 return false;
             }
 
@@ -352,8 +383,8 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
         if (ggml_is_quantized(src0->type) && !ggml_qnn_quantized_dynamic_ok() && src0->buffer == nullptr) {
             return false;
         }
-        // a wedged NPU and a shape already known to fail are refused here as well, so a
-        // weight is not placed on the NPU at load only to fall back at schedule time
+        // a wedged or lost NPU and a shape already known to fail are refused here as well, so
+        // a weight is not placed on the NPU at load only to fall back at schedule time
         // src0->data is NULL here, so a buffer means this is llama's placement probe and the
         // node's N is fictitious - see ggml_qnn_shape_denylisted
         if (ggml_backend_qnn_session_degraded() ||
@@ -420,7 +451,8 @@ static const char * ggml_backend_qnn_reg_get_name(ggml_backend_reg_t reg) {
 
 static size_t ggml_backend_qnn_reg_get_device_count(ggml_backend_reg_t reg) {
 #if defined(_M_ARM64) || defined(__aarch64__)
-    return ggml_backend_qnn_session_acquire(/*add_ref=*/false) ? 1 : 0;
+    // a lost session keeps its device, so ggml_backend_qnn_init gets the same no-claim backend
+    return (ggml_backend_qnn_session_acquire(/*add_ref=*/false) || ggml_backend_qnn_session_lost()) ? 1 : 0;
 #else
     // the HTP is reachable only from a native aarch64 process, so do not even probe for the
     // library in any other build. this is a compile-time fact about the binary, not about the

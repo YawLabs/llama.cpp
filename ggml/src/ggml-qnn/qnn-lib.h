@@ -40,8 +40,8 @@ struct ggml_qnn_graph {
     // 0 ms, with test-backend-ops at 47/47 either way. On by default; GGML_QNN_NO_F16_IO
     // restores the slow path for reproducing the bug. Set per graph and read by the IO sizing,
     // the cap arithmetic and both copies - every site must agree or the device reads the wrong
-    // bytes. NOTE: the shape key does not encode this, so a denylist FILE written by an older
-    // build can ban shapes that are now fast; delete a stale GGML_QNN_DENYLIST file.
+    // bytes. The shape key carries it as "_io16", so a denylist entry written for the
+    // mixed-dtype path (an older build, or GGML_QNN_NO_F16_IO) does not ban the fp16-IO graph
     bool f16_io = false;
     // matmul graphs are built with the batch dim N padded up to a power-of-two bucket
     // (GGML_QNN_NPAD is the floor, default 512), for both the static-baked and the dynamic
@@ -49,11 +49,20 @@ struct ggml_qnn_graph {
     // pooling matmul gets one graph per bucket instead of one per exact N. the padded tail
     // rows are never copied back. 0 means the exact ggml shape (elementwise graphs).
     //
-    // the padded-IO size law: a static-bake graph whose padded input (K * n_pad * 4) or
-    // output (M * n_pad * 4) reaches about 1 MiB hangs at execute on QAIRT 2.45 - measured
-    // 2026-09-16, a 4096 x 64 fp32 output of exactly 1 MiB timed out while 655 KB executed
-    // fine. ggml_qnn_mul_mat_policy rejects max(in, out) >= GGML_QNN_IO_MAX_KB (default 1024,
-    // strict) before graphCreate, as a policy verdict, never a denylist entry
+    // the padded-IO size law: the padded input is K * n_pad * e bytes and the output
+    // M * n_pad * e, e the IO element size (2 for an f16_io graph, 4 for an F32 weight or
+    // under GGML_QNN_NO_F16_IO). a static-bake graph whose padded IO reached about 1 MiB hung
+    // at execute on QAIRT 2.45 - measured 2026-09-16, a 4096 x 64 fp32 output of exactly 1 MiB
+    // timed out while 655 KB executed fine - and every such measurement ran on the mixed-dtype
+    // path f16_io replaced. fp16 IO does not follow it: measured 2026-09-27 with the cap
+    // lifted, K=512 static bakes at M = 512, 640, 768, 1024 and 2560 passed at GGML_QNN_NPAD
+    // 64, 256 and 512 (512 x 2560 at 512 writes 2.5 MiB; finalize 25.7 ms, validation execute
+    // 3.2 ms), and Qwen3-4B at -ub 512 baked 58 weights, the 9728-wide FFN among them, with no
+    // slow execute (exec_max_ms 18). ggml_qnn_mul_mat_arith_reject (supports_op and
+    // ggml_qnn_mul_mat_policy both call it) refuses n_pad * max(K, M) * e >= the cap (strict)
+    // before graphCreate, as a policy verdict, never a denylist entry. GGML_QNN_IO_MAX_KB set
+    // caps every matmul graph; unset, the default 1024 caps only the graphs with e = 4, the
+    // mixed-dtype path the hang was measured on and the F32 weight nothing has measured
     uint32_t n_pad = 0;
     // on-device bytes to charge against the static budget once finalize succeeds
     size_t pending_static_bytes = 0;
@@ -127,8 +136,10 @@ struct ggml_qnn_session {
     bool healthy_seen = false;
 
     // static-weight memory budget (bytes): only pin weights on the NPU up to this, the rest stay
-    // on the CPU. 0 means unlimited. GGML_QNN_STATIC_BUDGET_MB sets it, default 1024 as a
-    // margin (weight mapping failed at about 1170 MiB once, on a loaded machine)
+    // on the CPU. 0 means unlimited until a clamp (see proven_static) replaces it with the
+    // committed bytes. GGML_QNN_STATIC_BUDGET_MB sets it, default 1024 as a margin: weight
+    // mapping failed at about 1170 MiB committed on a machine loaded with other work
+    // (2026-09-16) and at 1830.0 MiB on a near-idle one with the budget lifted (2026-09-26)
     size_t static_budget = 0;
     size_t static_bytes  = 0;
 
@@ -138,6 +149,10 @@ struct ggml_qnn_session {
     // baked, the shape stays off the denylist and the session keeps its working graphs
     std::unordered_set<std::string> proven_static;
     bool budget_clamped = false;
+    // the phase and error code of the failure that clamped the budget, named in the stderr
+    // notice of a later budget refusal
+    const char *      clamp_phase = nullptr;
+    Qnn_ErrorHandle_t clamp_err   = QNN_SUCCESS;
 
     // fastrpc shared memory: the init-time self-test verdict gates every graph's IO setup,
     // and the host-buffer fallback is reported once per session
@@ -184,8 +199,9 @@ bool ggml_qnn_shape_denylisted(const struct ggml_tensor * node, bool placement_p
 bool ggml_qnn_mul_mat_type_claimable(enum ggml_type type);
 
 // the MUL_MAT rejections that are pure arithmetic on the shape, no session and no data needed:
-// the uint32_t size guard and the GGML_QNN_IO_MAX_KB cap, both at the padded batch
-// ggml_qnn_pad_n(N). supports_op calls it before it claims anything and ggml_qnn_mul_mat_policy
+// the uint32_t size guard and the padded-IO cap (GGML_QNN_IO_MAX_KB for every graph when it is
+// set, the default for 4-byte graph IO only when it is not, see ggml_qnn_graph::n_pad), both at
+// the padded batch ggml_qnn_pad_n(N). supports_op calls it before it claims anything and ggml_qnn_mul_mat_policy
 // calls the same function, so a claimed matmul is never refused at compute for one of them (a
 // claimed node that policy refuses FAILS the graph, it does not fall back).
 // N is src1->ne[1], except for llama's weight-placement probe (placement_probe: src0->data is
@@ -200,8 +216,13 @@ bool ggml_qnn_mul_mat_arith_reject(const struct ggml_tensor * op, bool placement
 bool ggml_qnn_quantized_dynamic_ok(void);
 
 // integer env var with a floor: unset or empty returns def; a value that is not entirely a
-// number, or below min, warns naming the variable and returns def
-static inline long long ggml_qnn_env_ll(const char * name, long long def, long long min) {
+// number, or below min, warns naming the variable and returns def. from_env, when given, is
+// set to whether the value came from the variable: false for unset, empty and both fallbacks,
+// so a malformed value behaves exactly like an unset one
+static inline long long ggml_qnn_env_ll(const char * name, long long def, long long min, bool * from_env = nullptr) {
+    if (from_env) {
+        *from_env = false;
+    }
     const char * val = getenv(name);
     if (!val || !*val) {
         return def;
@@ -217,14 +238,22 @@ static inline long long ggml_qnn_env_ll(const char * name, long long def, long l
         GGML_LOG_WARN("ggml-qnn: %s=%lld is below the minimum %lld, using %lld\n", name, v, min, def);
         return def;
     }
+    if (from_env) {
+        *from_env = true;
+    }
     return v;
 }
 
 // test-only fault hook: GGML_QNN_FAIL_EXECUTE=<substring> makes the validation execute of
 // every graph whose key contains the substring return an error before QNN is called, so the
-// degrade + denylist path can be exercised without wedging real hardware.
-// GGML_QNN_FAIL_EXECUTE_SKIP=<n> lets the first n matching graphs execute normally, which
-// reaches the proven-shape path (budget clamp, no degrade) the same way
+// degrade + denylist path can be exercised without wedging real hardware. Under
+// GGML_QNN_NO_PREVALIDATE no validation execute runs, so it fails the compute-time execute of
+// a matching graph instead. GGML_QNN_FAIL_EXECUTE_SKIP=<n> lets the first n matching executes
+// run normally, which reaches the proven-shape path (budget clamp, no degrade) the same way
+//
+// test-only fault hook: GGML_QNN_FAIL_INIT=<n> lets the first n session inits of the process
+// run and fails the next one before QnnHtp is loaded (one-shot), so a re-init that fails after
+// a successful session can be reached on a healthy device
 //
 // test-only fault hook: GGML_QNN_DELAY_EXECUTE=<substring> with GGML_QNN_DELAY_EXECUTE_MS=<ms>
 // sleeps that long inside the timed call, right before graphExecute, for an execute of a graph

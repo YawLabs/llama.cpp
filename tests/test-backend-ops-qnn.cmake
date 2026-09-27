@@ -38,6 +38,11 @@ string(REGEX REPLACE "\r" "\n" _all "${_all}")
 
 # no usable HTP: skip rather than fail, matching the lifecycle suite's SKIP_RETURN_CODE 77
 if (_all MATCHES "QnnHtp.dll could not be loaded|backend unavailable|no QNN device")
+    # like the lifecycle suite: GGML_QNN_TEST_REQUIRE_HTP (non-empty, not "0") turns the skip into a failure
+    if (NOT "$ENV{GGML_QNN_TEST_REQUIRE_HTP}" STREQUAL "" AND NOT "$ENV{GGML_QNN_TEST_REQUIRE_HTP}" STREQUAL "0")
+        message(STATUS "${_all}")
+        message(FATAL_ERROR "no usable HTP, and GGML_QNN_TEST_REQUIRE_HTP is set")
+    endif()
     message(STATUS "no usable HTP, skipping")
     return()
 endif()

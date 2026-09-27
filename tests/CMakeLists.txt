@@ -153,8 +153,8 @@ llama_build(test-save-load-state.cpp)
 
 if (GGML_QNN)
     # QNN backend lifecycle tests: need real HTP hardware, skip cleanly elsewhere.
-    # Serial: the HTP is single-client. The watchdog, fault, slow-* and *-timeout modes leave
-    # a degraded session behind on purpose and end the process without running DLL detach.
+    # Serial: the HTP is single-client. The watchdog, fault, slow-*, *-timeout and compute-error
+    # modes leave a degraded session behind on purpose and end the process without running DLL detach.
     llama_build(test-qnn-lifecycle.cpp)
 
     llama_test(test-qnn-lifecycle NAME test-qnn-basic    ARGS basic)
@@ -218,17 +218,20 @@ if (GGML_QNN)
     llama_test(test-qnn-lifecycle NAME test-qnn-quantized ARGS quantized)
     llama_test(test-qnn-lifecycle NAME test-qnn-envparse  ARGS envparse)
 
-    # the test-only hooks GGML_QNN_DELAY_EXECUTE and GGML_QNN_FAIL_FINALIZE reach the slow,
-    # timeout and finalize-error verdicts on a healthy device, with small F32 shapes. the
-    # slow-* and *-timeout modes keep a degraded session and end through hard_exit, so the
-    # runner keys off their marker line (below), like watchdog
+    # the test-only hooks GGML_QNN_DELAY_EXECUTE, GGML_QNN_FAIL_FINALIZE, GGML_QNN_FAIL_EXECUTE
+    # (compute-time, under GGML_QNN_NO_PREVALIDATE) and GGML_QNN_FAIL_INIT reach the slow,
+    # timeout, error and lost-session verdicts on a healthy device, with small F32 shapes. the
+    # slow-*, *-timeout and compute-error modes keep a degraded session and end through
+    # hard_exit, so the runner keys off their marker line (below), like watchdog
     llama_test(test-qnn-lifecycle NAME test-qnn-slow-validate         ARGS slow-validate)
     llama_test(test-qnn-lifecycle NAME test-qnn-slow-compute          ARGS slow-compute)
     llama_test(test-qnn-lifecycle NAME test-qnn-validate-timeout      ARGS validate-timeout)
     llama_test(test-qnn-lifecycle NAME test-qnn-validate-timeout-cold ARGS validate-timeout cold)
     llama_test(test-qnn-lifecycle NAME test-qnn-compute-timeout       ARGS compute-timeout)
+    llama_test(test-qnn-lifecycle NAME test-qnn-compute-error         ARGS compute-error)
     llama_test(test-qnn-lifecycle NAME test-qnn-finalize-error        ARGS finalize-error)
     llama_test(test-qnn-lifecycle NAME test-qnn-denylist-append       ARGS denylist-append)
+    llama_test(test-qnn-lifecycle NAME test-qnn-reinit-fail           ARGS reinit-fail)
 
     set_tests_properties(test-qnn-noopt               PROPERTIES ENVIRONMENT "GGML_QNN_NO_OPT=1")
     set_tests_properties(test-qnn-modelscale-shm      PROPERTIES ENVIRONMENT "GGML_QNN_SHARED_MEM=1")
@@ -263,13 +266,16 @@ if (GGML_QNN)
         PASS_REGULAR_EXPRESSION "VALIDATE-TIMEOUT-CHECKS-PASSED")
     set_tests_properties(test-qnn-compute-timeout PROPERTIES
         PASS_REGULAR_EXPRESSION "COMPUTE-TIMEOUT-CHECKS-PASSED")
+    set_tests_properties(test-qnn-compute-error PROPERTIES
+        PASS_REGULAR_EXPRESSION "COMPUTE-ERROR-CHECKS-PASSED")
     # these build a few small graphs and finish in seconds, the fp16 ones of fault and
     # quantized included even at the slow fp16 speed; 180 s is above the 120 s build watchdog
     set_tests_properties(
         test-qnn-watchdog test-qnn-fault
         test-qnn-slow-validate test-qnn-slow-compute
         test-qnn-validate-timeout test-qnn-validate-timeout-cold test-qnn-compute-timeout
-        test-qnn-finalize-error test-qnn-denylist-append
+        test-qnn-compute-error test-qnn-finalize-error test-qnn-denylist-append
+        test-qnn-reinit-fail
         test-qnn-reuse test-qnn-dyncache test-qnn-quantized test-qnn-envparse
         PROPERTIES TIMEOUT 180)
 
@@ -585,9 +591,10 @@ if (GGML_QNN)
         set_tests_properties(test-backend-ops-qnn PROPERTIES TIMEOUT 600)
     endif()
 
-    # the HTP is single-client: the tests that can open the QNN device (any model load or
-    # backend enumeration) must not overlap EACH OTHER under ctest -j. the test-qnn-* entries
-    # need nothing from this block, they are RUN_SERIAL already and so exclude every other test
+    # the HTP is single-client: the tests that can open the QNN device (any model load, backend
+    # enumeration, or argument parsing: llama_supports_rpc enumerates the registry) must not
+    # overlap EACH OTHER under ctest -j. the test-qnn-* entries need nothing from this block,
+    # they are RUN_SERIAL already and so exclude every other test
     get_property(_qnn_all_tests DIRECTORY PROPERTY TESTS)
     # test-save-load-state and test-generate-models are deliberately absent: upstream keeps
     # them behind if(NOT WIN32 OR NOT BUILD_SHARED_LIBS) because they call internals not
@@ -597,7 +604,8 @@ if (GGML_QNN)
         test-backend-ops-qnn test-thread-safety test-model-load-cancel test-autorelease
         test-state-restore-fragmented test-backend-sampler
         test-opt test-gguf
-        test-list-devices-output)
+        test-list-devices-output
+        test-arg-parser test-model-resolution)
     foreach (_test IN LISTS _qnn_all_tests)
         if (_test MATCHES "^test-tokenizer-[01]-" OR _test MATCHES "^test-recurrent-state-rollback")
             list(APPEND _qnn_serial_tests ${_test})
