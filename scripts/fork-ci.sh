@@ -20,6 +20,8 @@
 #   scripts/fork-ci.sh cpu        # the plain CPU config
 #   scripts/fork-ci.sh all        # all three
 #   CONFIGURE=1 scripts/fork-ci.sh npu     # force a fresh cmake configure
+#   JOBS=4 scripts/fork-ci.sh cpu          # build parallelism (default: every core)
+#   BUILD_ONLY=1 scripts/fork-ci.sh gpu    # skip the tests (scripts/fork-build.sh sets this)
 #
 set -euo pipefail
 
@@ -45,23 +47,46 @@ BASE_FLAGS=(
     -DGGML_CPU_REPACK=ON
     -DGGML_LLAMAFILE=ON
     -DGGML_OPENMP=OFF
-    -DLLAMA_CURL=OFF
+    # no HTTPS (no -hf downloads): there is no OpenSSL on this box, and LLAMA_CURL is gone
+    # upstream. -DLLAMA_BUILD_BORINGSSL=ON instead would fetch and build BoringSSL for it.
+    -DLLAMA_OPENSSL=OFF
+    # build the server UI from this tree with npm, and never fall back to a prebuilt upstream
+    # UI: that one is keyed to the commit count, which in a fork names a different upstream
+    # build, and the fallback would be silent if npm failed
+    -DLLAMA_BUILD_UI=ON
+    -DLLAMA_USE_PREBUILT_UI=OFF
 )
 
 say() { printf '\n=== %s ===\n' "$1"; }
 
+# BUILD_ONLY follows CONFIGURE's convention: unset, empty or 0 means off
+build_only() { case "${BUILD_ONLY:-0}" in 0|"") return 1 ;; *) return 0 ;; esac; }
+
 build_one() {
     local target="$1" dir="$2"; shift 2
-    local extra=("$@")
 
-    if [ ! -f "$dir/CMakeCache.txt" ] || [ -n "${CONFIGURE:-}" ]; then
-        say "configure $target -> $dir"
-        cmake -B "$dir" "${BASE_FLAGS[@]}" "${extra[@]}"
+    # never build while a binary from this dir is running: relinking an in-use DLL or EXE
+    # fails with a permission error that looks like a compiler problem. Opening for append
+    # without writing leaves the mtime alone.
+    local f busy=()
+    for f in "$dir"/bin/*.dll "$dir"/bin/*.exe; do
+        [ -e "$f" ] || continue
+        { : >> "$f"; } 2>/dev/null || busy+=("${f##*/}")
+    done
+    if [ ${#busy[@]} -gt 0 ]; then
+        echo "error: in use from $dir/bin: ${busy[*]} - stop those processes first" >&2
+        return 1
     fi
+
+    # always configure (~2 s on a warm tree): re-applies BASE_FLAGS and the extras to an
+    # existing cache and retries a configure that failed. CONFIGURE=1 adds --fresh, which
+    # also drops cached values this script no longer passes.
+    local fresh=()
+    case "${CONFIGURE:-0}" in 0|"") ;; *) fresh=(--fresh) ;; esac
+    say "configure $target -> $dir"
+    cmake -B "$dir" "${fresh[@]}" "${BASE_FLAGS[@]}" "$@"
     say "build $target"
-    # never build while a binary from this dir is running: relinking ggml.dll then fails with
-    # a permission error that looks like a compiler problem
-    cmake --build "$dir" -- -j "${JOBS:-6}"
+    cmake --build "$dir" -j "${JOBS:-$(nproc)}"
 }
 
 run_fork_tests() {
@@ -79,13 +104,24 @@ run_fork_tests() {
         --output-on-failure
 }
 
+run_opencl_tests() {
+    local dir="$1" out rc=0
+    say "OpenCL op tests ($dir)"
+    # -b is an exact device-name match; with no GPUOpenCL device every backend is
+    # "Skipping" and the binary still exits 0, so also require a non-zero pass count
+    out="$("$dir/bin/test-backend-ops" -b GPUOpenCL -o MUL_MAT 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then printf '%s\n' "$out"; return "$rc"; fi
+    grep -E 'tests passed|backends passed' <<<"$out" || true
+    grep -Eq '^ +[1-9][0-9]*/[0-9]+ tests passed' <<<"$out" || { echo "error: no GPUOpenCL test ran" >&2; return 1; }
+}
+
 mode="${1:-npu}"
 
 case "$mode" in
     npu|all)
         build_one "QNN / Hexagon NPU" build-npu \
             -DGGML_QNN=ON "-DQNN_SDK_ROOT=${QNN_SDK_ROOT}"
-        run_fork_tests build-npu
+        build_only || run_fork_tests build-npu
         [ "$mode" = "all" ] || exit 0
         ;&
     gpu)
@@ -97,6 +133,7 @@ case "$mode" in
             -DGGML_OPENCL_EMBED_KERNELS=ON \
             "-DOpenCL_INCLUDE_DIR=${OPENCL_SDK}/OpenCL-Headers" \
             "-DOpenCL_LIBRARY=${OPENCL_SDK}/OpenCL.lib"
+        build_only || run_opencl_tests build-gpu
         [ "$mode" = "all" ] || exit 0
         ;&
     cpu)
