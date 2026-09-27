@@ -6,12 +6,17 @@
 #    so a QNN build gets no op-level correctness entry unless the fork adds one.
 #
 # 2. test-backend-ops reports "Backend QNN: OK" when every case was REFUSED by
-#    supports_op - a pass that compared zero numbers. At the default GGML_QNN_NPAD=512
-#    the pad bucket lifts every small test shape over GGML_QNN_IO_MAX_KB, so all ~1680
-#    MUL_MAT shapes are declined and the suite still reports green. Measured
-#    2026-09-22: default 0 executed, NPAD=32 alone 2, NPAD=32 + MIN_DIM=1 47.
-#    So the driver pins the settings that make the shapes claimable AND asserts that
-#    a non-zero number of cases actually ran.
+#    supports_op - a pass that compared zero numbers. Measured 2026-09-22, when one
+#    1 MiB IO cap covered every graph: default env 0 executed, NPAD=32 alone 2,
+#    NPAD=32 + MIN_DIM=1 47. The default GGML_QNN_MIN_DIM of 32 declines most shapes
+#    (m is 1 or 16, or n is under 32). The default env was not measured again after
+#    the cap default changed (2026-09-27: unset, fp16 graph IO is capped at 10 MiB,
+#    fp32 at 1 MiB), so the driver does not rely on it: it pins the settings that
+#    make the shapes claimable AND asserts that a non-zero number of cases actually ran.
+#
+# GGML_QNN_IO_MAX_KB is pinned too, to unset: a value exported by the caller's shell
+# caps every graph at that size and changes how many cases run (a set 1024 refuses
+# the two F16 cases whose padded input is 2 MiB).
 #
 # Parsing note: the QNN SDK writes progress bars with bare CR and its own log lines
 # interleave with the per-case results, so counting "): OK" lines undercounts wildly.
@@ -23,6 +28,7 @@ endif()
 
 set(ENV{GGML_QNN_NPAD}    "32")
 set(ENV{GGML_QNN_MIN_DIM} "1")
+unset(ENV{GGML_QNN_IO_MAX_KB})
 
 execute_process(
     COMMAND "${BIN}" -b QNN -o MUL_MAT

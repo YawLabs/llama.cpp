@@ -282,8 +282,9 @@ if (GGML_QNN)
     # a machine without an HTP must still pass the suite (every entry reports NOT RUN), so
     # the default is OFF. turn it ON on a box that has one: a missing QNN device then fails
     # every entry instead of skipping it, so a build where the backend never registers cannot
-    # report green. APPEND keeps the per-entry ENVIRONMENT values set above
-    option(LLAMA_QNN_TEST_REQUIRE_HTP "llama: fail the test-qnn-* entries when no HTP is found" OFF)
+    # report green. APPEND keeps the per-entry ENVIRONMENT values set above.
+    # test-backend-ops-qnn is registered further down and gets the variable there
+    option(LLAMA_QNN_TEST_REQUIRE_HTP "llama: fail the test-qnn-* entries and test-backend-ops-qnn when no HTP is found" OFF)
     if (LLAMA_QNN_TEST_REQUIRE_HTP)
         foreach (_test IN LISTS _qnn_tests)
             set_property(TEST ${_test} APPEND PROPERTY ENVIRONMENT "GGML_QNN_TEST_REQUIRE_HTP=1")
@@ -579,8 +580,8 @@ if (GGML_QNN)
     # upstream b78a39a2f turned test-backend-ops into a build-only target and runs it from
     # ci/run.sh instead. that drops it from ctest, and it is this backend's MUL_MAT correctness
     # evidence, so a QNN build registers it again - through a driver, because registering the
-    # binary directly passes VACUOUSLY: at the default pad bucket every test shape is declined
-    # by supports_op and it still prints OK. see test-backend-ops-qnn.cmake
+    # binary directly can pass VACUOUSLY: at the default env every test shape was declined by
+    # supports_op (measured 2026-09-22) and it still printed OK. see test-backend-ops-qnn.cmake
     if (TARGET test-backend-ops AND NOT TEST test-backend-ops-qnn)
         llama_test_cmd(
             ${CMAKE_COMMAND}
@@ -589,6 +590,10 @@ if (GGML_QNN)
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-ops-qnn.cmake
         )
         set_tests_properties(test-backend-ops-qnn PROPERTIES TIMEOUT 600)
+        # the driver reads it: no usable HTP is then a failure, not a skip that reports Passed
+        if (LLAMA_QNN_TEST_REQUIRE_HTP)
+            set_property(TEST test-backend-ops-qnn APPEND PROPERTY ENVIRONMENT "GGML_QNN_TEST_REQUIRE_HTP=1")
+        endif()
     endif()
 
     # the HTP is single-client: the tests that can open the QNN device (any model load, backend

@@ -882,8 +882,8 @@ static bool ggml_qnn_no_f16_io() {
 
 // graph IO is fp16 whenever the weight is, so the cap must measure the bytes the graph will
 // really allocate. Counting 4 per element there refuses shapes that now fit in half the space.
-// the element size also decides whether the default cap applies at all: it caps 4-byte IO
-// only, see ggml_qnn_io_capped
+// the element size also picks the default cap, which is larger for fp16 IO, see
+// ggml_qnn_io_capped
 static uint64_t ggml_qnn_io_elem_size(const ggml_tensor * node) {
     const bool f16 = !ggml_qnn_no_f16_io() && node->op == GGML_OP_MUL_MAT &&
                      ggml_qnn_weight_dtype(node->src[0]->type) == QNN_DATATYPE_FLOAT_16;
@@ -936,34 +936,49 @@ static std::string ggml_qnn_graph_key(const ggml_tensor * node) {
 }
 
 // the IO-size cap, see ggml_qnn_graph::n_pad. GGML_QNN_IO_MAX_KB set to a number caps every
-// matmul graph at that size. unset, the default 1024 caps only the graphs whose IO is 4 bytes
-// per element (an F32 weight, or any weight under GGML_QNN_NO_F16_IO): the hang the cap exists
-// for was measured on the mixed-dtype path, fp16 graph IO ran far past 1 MiB without it, and
-// capping fp16 IO only forced small ubatches. a malformed value warns and counts as unset.
+// matmul graph at that size. unset, the default follows the IO element size: 1024 for the
+// graphs whose IO is 4 bytes per element (an F32 weight, or any weight under
+// GGML_QNN_NO_F16_IO), the mixed-dtype path the hang was measured on, and 10240 for fp16 graph
+// IO. 10240 is a bound on what was measured, not a hang threshold: the largest fp16 padded IO
+// that has run is 9.5 MiB (the 9728-wide FFN at N=512) and passes, a 151936-wide output layer
+// at N=512 is 148.4 MiB, has never run, and is refused. a value that is not usable counts as
+// unset and says so on stderr.
 // logged once per shape key: the same shape comes back once per weight and per session, and
 // DEBUG once is enough to explain a CPU placement
 //
 // the first refusal of the process is a WARN that names the way out: at the default
-// GGML_QNN_NPAD an F32 weight 512 or more wide is refused here (and, with the cap set to 1024,
-// every weight of a 4B model), and at DEBUG alone the user who asked for the NPU got a CPU run
-// with no line saying why
+// GGML_QNN_NPAD an F32 weight 512 or more wide and an F16 or quantized weight 10240 or more
+// wide are refused here (and, with the cap set to 1024, every weight of a 4B model), and at
+// DEBUG alone the user who asked for the NPU got a CPU run with no line saying why
 static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
     struct io_cap {
-        uint64_t bytes;
-        bool     set; // GGML_QNN_IO_MAX_KB parsed: the cap covers fp16 graph IO too
+        uint64_t bytes;     // 4-byte graph IO
+        uint64_t bytes_f16; // fp16 graph IO
+        bool     set;       // GGML_QNN_IO_MAX_KB parsed: one cap for every graph
     };
     static const io_cap cap = [] {
+        const long long def_kb = 1024, def_f16_kb = 10240;
         bool set = false;
-        const long long kb = ggml_qnn_env_ll("GGML_QNN_IO_MAX_KB", 1024, 1, &set);
-        return io_cap{ (uint64_t) kb * 1024, set };
+        long long kb = ggml_qnn_env_ll("GGML_QNN_IO_MAX_KB", def_kb, 1, &set);
+        // IO over 4 GiB is refused before it gets here (the uint32 guard), so a larger cap is
+        // the same cap, and the byte count below cannot wrap
+        kb = std::min<long long>(kb, (long long) UINT32_MAX / 1024 + 1);
+        const char * val = getenv("GGML_QNN_IO_MAX_KB");
+        if (!set && val && *val) {
+            // stderr, like the refusal below. unset is two defaults, not the one number a set
+            // 1024 is, so the line gives both
+            fprintf(stderr, "ggml-qnn: GGML_QNN_IO_MAX_KB=\"%s\" is not a whole number of KB, 1 or more: it counts as unset, so the defaults apply "
+                            "(fp32 graph IO capped at %lld KB, fp16 graph IO at %lld KB)\n",
+                    val, def_kb, def_f16_kb);
+            fflush(stderr);
+        }
+        return io_cap{ (uint64_t) kb * 1024, (uint64_t) (set ? kb : def_f16_kb) * 1024, set };
     }();
-    const uint64_t elem = ggml_qnn_io_elem_size(node);
-    if (!cap.set && elem == sizeof(ggml_fp16_t)) {
-        return false;
-    }
+    const uint64_t elem      = ggml_qnn_io_elem_size(node);
+    const uint64_t cap_bytes = elem == sizeof(ggml_fp16_t) ? cap.bytes_f16 : cap.bytes;
     const uint64_t in_bytes  = (uint64_t) node->src[1]->ne[0] * pad * elem;
     const uint64_t out_bytes = (uint64_t) node->src[0]->ne[1] * pad * elem;
-    if (std::max(in_bytes, out_bytes) < cap.bytes) {
+    if (std::max(in_bytes, out_bytes) < cap_bytes) {
         return false;
     }
     static std::mutex                       logged_mutex;
@@ -981,21 +996,23 @@ static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
         // the largest power-of-two batch whose padded IO still fits under the cap
         const uint64_t row_bytes = std::max<uint64_t>(node->src[1]->ne[0], node->src[0]->ne[1]) * elem;
         uint32_t fit = 0;
-        for (uint32_t p = 1; (uint64_t) p * row_bytes < cap.bytes; p <<= 1) {
+        for (uint32_t p = 1; (uint64_t) p * row_bytes < cap_bytes; p <<= 1) {
             fit = p;
         }
         // warn only when a pad bucket can fix it. supports_op refuses batches under
         // GGML_QNN_MIN_DIM, so a shape that fits only below that (at a 1 MiB cap: a 151936-wide
         // output layer; a 9728-wide FFN only at 4 bytes per element, an F32 weight or
         // GGML_QNN_NO_F16_IO, since at 2 it fits at 32) never runs here at that cap: it stays at
-        // DEBUG and does not spend the one WARN a fixable refusal needs
+        // DEBUG and does not spend the one WARN a fixable refusal needs. at the fp16 default
+        // the output layer fits at 32 (9.3 MiB), so there it is a fixable refusal and warns
         static const uint32_t min_dim = (uint32_t) ggml_qnn_env_ll("GGML_QNN_MIN_DIM", 32, 1);
         if (fit >= min_dim) {
             warned = true;
             // which cap refused it, so the line names the right lever: a set GGML_QNN_IO_MAX_KB
-            // caps every graph; the default caps 4-byte graph IO only, which an F16 or quantized
-            // weight has only under GGML_QNN_NO_F16_IO
-            const char * cap_src = cap.set ? "GGML_QNN_IO_MAX_KB"
+            // caps every graph; unset, the default is the one of the graph's IO element size,
+            // and an F16 or quantized weight has 4-byte IO only under GGML_QNN_NO_F16_IO
+            const char * cap_src = cap.set                     ? "GGML_QNN_IO_MAX_KB"
+                                 : elem == sizeof(ggml_fp16_t) ? "the GGML_QNN_IO_MAX_KB default for fp16 graph IO"
                                  : ggml_qnn_weight_dtype(node->src[0]->type) == QNN_DATATYPE_FLOAT_16
                                      ? "the GGML_QNN_IO_MAX_KB default for fp32 graph IO, which GGML_QNN_NO_F16_IO selects"
                                      : "the GGML_QNN_IO_MAX_KB default for fp32 graph IO";
@@ -1004,7 +1021,7 @@ static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
             fprintf(stderr, "ggml-qnn: a %s %" PRId64 "x%" PRId64 " matmul stays on the CPU: its padded IO is %.1f MiB at N=%u, at or over the %.1f MiB cap "
                             "(%s); GGML_QNN_NPAD=%u with -ub %u (or lower) fits it. later IO-cap refusals are logged at DEBUG\n",
                     ggml_type_name(node->src[0]->type), node->src[0]->ne[0], node->src[0]->ne[1],
-                    std::max(in_bytes, out_bytes) / (1024.0 * 1024.0), pad, cap.bytes / (1024.0 * 1024.0), cap_src, fit, fit);
+                    std::max(in_bytes, out_bytes) / (1024.0 * 1024.0), pad, cap_bytes / (1024.0 * 1024.0), cap_src, fit, fit);
             fflush(stderr);
         }
     }
@@ -1022,7 +1039,8 @@ bool ggml_qnn_mul_mat_arith_reject(const ggml_tensor * op, bool placement_probe)
         return true;
     }
     // a padded IO buffer at or past the cap hung the execute on the mixed-dtype path (the
-    // padded-IO size law); unset, the cap covers 4-byte graph IO only, see ggml_qnn_io_capped
+    // padded-IO size law); unset, fp16 graph IO has its own, larger default, see
+    // ggml_qnn_io_capped
     return ggml_qnn_io_capped(op, Nb);
 }
 

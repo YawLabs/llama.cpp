@@ -12,6 +12,7 @@
 #include <QnnInterface.h>
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -54,15 +55,17 @@ struct ggml_qnn_graph {
     // under GGML_QNN_NO_F16_IO). a static-bake graph whose padded IO reached about 1 MiB hung
     // at execute on QAIRT 2.45 - measured 2026-09-16, a 4096 x 64 fp32 output of exactly 1 MiB
     // timed out while 655 KB executed fine - and every such measurement ran on the mixed-dtype
-    // path f16_io replaced. fp16 IO does not follow it: measured 2026-09-27 with the cap
+    // path f16_io replaced. fp16 IO ran past that size: measured 2026-09-27 with the cap
     // lifted, K=512 static bakes at M = 512, 640, 768, 1024 and 2560 passed at GGML_QNN_NPAD
     // 64, 256 and 512 (512 x 2560 at 512 writes 2.5 MiB; finalize 25.7 ms, validation execute
     // 3.2 ms), and Qwen3-4B at -ub 512 baked 58 weights, the 9728-wide FFN among them, with no
-    // slow execute (exec_max_ms 18). ggml_qnn_mul_mat_arith_reject (supports_op and
-    // ggml_qnn_mul_mat_policy both call it) refuses n_pad * max(K, M) * e >= the cap (strict)
-    // before graphCreate, as a policy verdict, never a denylist entry. GGML_QNN_IO_MAX_KB set
-    // caps every matmul graph; unset, the default 1024 caps only the graphs with e = 4, the
-    // mixed-dtype path the hang was measured on and the F32 weight nothing has measured
+    // slow execute (exec_max_ms 18). that FFN's 9.5 MiB is the largest padded IO that has run.
+    // ggml_qnn_mul_mat_arith_reject (supports_op and ggml_qnn_mul_mat_policy both call it)
+    // refuses n_pad * max(K, M) * e >= the cap (strict) before graphCreate, as a policy
+    // verdict, never a denylist entry. GGML_QNN_IO_MAX_KB set caps every matmul graph; unset,
+    // the default is 1024 for the graphs with e = 4, the mixed-dtype path the hang was measured
+    // on and the F32 weight nothing has measured, and 10240 for e = 2: over the 9.5 MiB that
+    // ran, under the sizes nothing has run (a 151936-wide output layer is 148.4 MiB at 512)
     uint32_t n_pad = 0;
     // on-device bytes to charge against the static budget once finalize succeeds
     size_t pending_static_bytes = 0;
@@ -200,7 +203,7 @@ bool ggml_qnn_mul_mat_type_claimable(enum ggml_type type);
 
 // the MUL_MAT rejections that are pure arithmetic on the shape, no session and no data needed:
 // the uint32_t size guard and the padded-IO cap (GGML_QNN_IO_MAX_KB for every graph when it is
-// set, the default for 4-byte graph IO only when it is not, see ggml_qnn_graph::n_pad), both at
+// set, one default per IO element size when it is not, see ggml_qnn_graph::n_pad), both at
 // the padded batch ggml_qnn_pad_n(N). supports_op calls it before it claims anything and ggml_qnn_mul_mat_policy
 // calls the same function, so a claimed matmul is never refused at compute for one of them (a
 // claimed node that policy refuses FAILS the graph, it does not fall back).
@@ -215,10 +218,13 @@ bool ggml_qnn_mul_mat_arith_reject(const struct ggml_tensor * op, bool placement
 // is not baked statically. read once
 bool ggml_qnn_quantized_dynamic_ok(void);
 
-// integer env var with a floor: unset or empty returns def; a value that is not entirely a
-// number, or below min, warns naming the variable and returns def. from_env, when given, is
-// set to whether the value came from the variable: false for unset, empty and both fallbacks,
-// so a malformed value behaves exactly like an unset one
+// integer env var with a floor: unset or empty returns def; a value that is not a number, or
+// below min, warns naming the variable and returns def. whitespace after the number is not
+// part of the value: cmd.exe's "set X=1024 && prog" leaves a space there. from_env, when
+// given, is set to whether the value came from the variable: false for unset, empty and both
+// fallbacks, so a malformed value behaves exactly like an unset one. a caller that passes it
+// reports an unusable value itself and no WARN is logged here: its default is more than the
+// one number def, which "using the default N" would hide
 static inline long long ggml_qnn_env_ll(const char * name, long long def, long long min, bool * from_env = nullptr) {
     if (from_env) {
         *from_env = false;
@@ -229,13 +235,21 @@ static inline long long ggml_qnn_env_ll(const char * name, long long def, long l
     }
     char * end = nullptr;
     errno = 0;
-    const long long v = strtoll(val, &end, 10);
-    if (end == val || *end != '\0' || errno == ERANGE) {
-        GGML_LOG_WARN("ggml-qnn: %s=\"%s\" is not a number, using %lld\n", name, val, def);
+    const long long v      = strtoll(val, &end, 10);
+    const bool      is_num = end != val && errno != ERANGE;
+    while (is_num && isspace((unsigned char) *end)) {
+        end++;
+    }
+    if (!is_num || *end != '\0') {
+        if (!from_env) {
+            GGML_LOG_WARN("ggml-qnn: %s=\"%s\" is not a number, using the default %lld\n", name, val, def);
+        }
         return def;
     }
     if (v < min) {
-        GGML_LOG_WARN("ggml-qnn: %s=%lld is below the minimum %lld, using %lld\n", name, v, min, def);
+        if (!from_env) {
+            GGML_LOG_WARN("ggml-qnn: %s=%lld is below the minimum %lld, using the default %lld\n", name, v, min, def);
+        }
         return def;
     }
     if (from_env) {

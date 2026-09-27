@@ -67,9 +67,10 @@
 //                                 directly and fails if the runtime itself is not loadable)
 //   test-qnn-lifecycle mindim     at DEFAULT env the min-dim gate refuses small matmuls
 //                                 while claiming normal ones; the default of 32 is pinned.
-//                                 and with GGML_QNN_IO_MAX_KB unset the IO cap covers fp32
-//                                 graph IO only: an F16 weight whose padded IO is over 1 MiB
-//                                 is claimed and computes, an F32 one at 1 MiB is refused
+//                                 and the two IO cap defaults of an unset GGML_QNN_IO_MAX_KB:
+//                                 fp16 graph IO of 2.5 MiB is claimed and computes, just
+//                                 under 10 MiB is claimed and at 10 MiB refused (probes, no
+//                                 bake), fp32 graph IO at 1 MiB is refused
 //   test-qnn-lifecycle elementwise  at DEFAULT env ADD/MUL must be refused (the HTP has a
 //                                 known broadcast bug), while mul_mat is still claimed
 //   test-qnn-lifecycle elementwise-on  with GGML_QNN_ELEMENTWISE=1 the GGML_QNN_MIN_ELEMENTS gate
@@ -84,8 +85,9 @@
 //                                 the padded-IO cap is part of that answer: a capped
 //                                 buffer-less matmul and a weight capped at the smallest
 //                                 bucket are refused, never claimed and failed at compute
-//                                 (main sets GGML_QNN_IO_MAX_KB=1024, so the cap covers the
-//                                 fp16-IO weights these cases use).
+//                                 (main sets GGML_QNN_IO_MAX_KB=1024, so the fp16-IO weights
+//                                 these cases use are capped at 1 MiB, not at the 10 MiB of
+//                                 the unset default).
 //                                 also the refusals decided by form alone (3D, strided, BF16
 //                                 weight, F16 activation) and by buffer (a weight in CPU_REPACK,
 //                                 directly and through a reshape; supports_buft)
@@ -114,7 +116,8 @@
 //                                 path and matches the CPU
 //   test-qnn-lifecycle envparse   malformed GGML_QNN_NPAD, GGML_QNN_MIN_DIM and
 //                                 GGML_QNN_IO_MAX_KB values fall back to their defaults; a
-//                                 malformed cap behaves as unset, capping fp32 graph IO only
+//                                 malformed cap counts as unset: fp32 graph IO is capped at
+//                                 1 MiB, fp16 at 10 MiB
 //
 // The modes below drive the test-only hooks GGML_QNN_DELAY_EXECUTE, GGML_QNN_FAIL_FINALIZE,
 // GGML_QNN_FAIL_EXECUTE and GGML_QNN_FAIL_INIT (qnn-lib.h) on small F32 shapes at
@@ -604,7 +607,7 @@ static int scenario_basic(void) {
     // and stay correct at every N (padded IO copy paths). padded IO is in = K * pad * e and
     // out = M * pad * e bytes, e = 4 for the F32 weight and 2 for the others (their graph IO
     // is fp16), and the GGML_QNN_IO_MAX_KB=1024 main sets (strict) refuses 1 MiB at either e;
-    // unset, the default would not cap e = 2 at all. at e = 4:
+    // unset, the default for e = 2 would be 10 MiB. at e = 4:
     //   K=256 M=128 pad  512: in 512 KiB, out 256 KiB -> claimed
     //   K=128 M=128 pad 1024: in 512 KiB, out 512 KiB -> claimed, keeps the 1024-bucket copy path under test
     // and half that at e = 2. the refusal, an F16 K=512 M=128 at pad 1024 (in exactly 1 MiB
@@ -663,8 +666,8 @@ static int scenario_basic(void) {
     // taken before graphCreate. It must not degrade the session, which the compute after the
     // reacquire below would show. (K was 256 while IO was fp32 - halving the element size
     // doubled the K that reaches the cap, which is the point of the fix, so this case moved
-    // with it rather than being weakened.) The refusal needs the cap SET: unset, it covers
-    // fp32 graph IO only and an fp16-IO shape past 1 MiB is claimed, see scenario_mindim
+    // with it rather than being weakened.) The refusal needs the cap SET: unset, the default
+    // for fp16 graph IO is 10 MiB and this shape is claimed, see scenario_mindim
     const mul_mat_case capped = { GGML_TYPE_F16, 512, 128, 513 };
     check(!probe_claim(qnn, capped), "512x128 N=513 refused: padded input reaches GGML_QNN_IO_MAX_KB=1024, set, which caps fp16 graph IO too");
 
@@ -691,8 +694,8 @@ static int scenario_budget(void) {
     ggml_backend_t qnn = qnn_backend_init_checked();
 
     // f16 weight of 4 MiB against a 1 MiB budget: refused as policy, never denylisted. main
-    // sets GGML_QNN_NPAD=64 so the padded IO (in 512 KiB, out 256 KiB) stays under even a
-    // 1 MiB GGML_QNN_IO_MAX_KB (unset, the cap does not cover this fp16-IO graph at all): the
+    // sets GGML_QNN_NPAD=64 so the padded IO (in 256 KiB, out 128 KiB) stays under even a
+    // 1 MiB GGML_QNN_IO_MAX_KB (unset, the default for this fp16-IO graph is 10 MiB): the
     // refusal is then the budget's alone, and a deleted budget gate shows up as a clean claim
     // of a small graph here rather than as a 2 MiB validation execute at the 512 bucket
     const mul_mat_case big = { GGML_TYPE_F16, 2048, 1024, 64 };
@@ -1076,7 +1079,7 @@ static int scenario_disable(void) {
 
 // default-env gate: with GGML_QNN_MIN_DIM unset (default 32), small matmuls must be refused
 // (they are memory-bound and belong on the CPU) while normal shapes are still claimed.
-// the IO cap's default is pinned here too, since this is the mode that runs at default env
+// the IO cap's defaults are pinned here too, since this is the mode that runs at default env
 static int scenario_mindim(void) {
     printf("scenario: mindim (default env)\n");
     ggml_backend_t qnn = qnn_backend_init_checked();
@@ -1095,11 +1098,11 @@ static int scenario_mindim(void) {
     const mul_mat_case n32 = { GGML_TYPE_F16, 256, 256, 32 };
     check(probe_claim(qnn, n32), "256x256 N=32 claimed: exactly the default GGML_QNN_MIN_DIM");
 
-    // GGML_QNN_IO_MAX_KB unset caps only the graphs whose IO is 4 bytes per element. an F16
-    // weight's graph IO is fp16: 512x2560 at N=64 pads to the default 512 bucket, 512 KiB in
-    // and 2.5 MiB out, and must be claimed and compute correctly (the shape bigstatic ran at
-    // GGML_QNN_NPAD=512 on 2026-09-27: 2621440 bytes written, validation execute 3.2 ms).
-    // before the default changed, the 1 MiB cap refused it
+    // GGML_QNN_IO_MAX_KB unset has one default per IO element size: 1 MiB at 4 bytes, 10 MiB
+    // at 2. an F16 weight's graph IO is fp16: 512x2560 at N=64 pads to the default 512 bucket,
+    // 512 KiB in and 2.5 MiB out, and must be claimed and compute correctly (the shape
+    // bigstatic ran at GGML_QNN_NPAD=512 on 2026-09-27: 2621440 bytes written, validation
+    // execute 3.2 ms). a 1 MiB cap on fp16 IO refused it
     const mul_mat_case wide16 = { GGML_TYPE_F16, 512, 2560, 64 };
     bool claimed = false;
     std::vector<float> got, ref;
@@ -1107,10 +1110,25 @@ static int scenario_mindim(void) {
     const bool ok_c = run_mul_mat(cpu, wide16, ref);
     const double e  = claimed && ok_q && ok_c ? nmse(ref, got) : -1.0;
     char msg[224];
-    snprintf(msg, sizeof(msg), "F16 512x2560 N=64 claimed and matches CPU (nmse %.2e): 2.5 MiB of fp16 padded output, uncapped with GGML_QNN_IO_MAX_KB unset", e);
+    snprintf(msg, sizeof(msg), "F16 512x2560 N=64 claimed and matches CPU (nmse %.2e): 2.5 MiB of fp16 padded output, under the default for fp16 graph IO", e);
     check(claimed && ok_q && ok_c && e >= 0.0 && e < 5e-4, msg);
 
-    // fp32 graph IO keeps the default 1 MiB cap: an F32 512x128 weight at the same bucket is
+    // the fp16 default itself, 10240 KB, strict. placement probes: the verdict is arithmetic
+    // at the smallest bucket (512 here) and nothing is baked, which matters for the sizes
+    // that have never run on the device. 10239 wide is 1 KiB under the cap, 10240 is on it
+    ggml_backend_dev_t dev = ggml_backend_get_device(qnn);
+    const mul_mat_case f16_under = { GGML_TYPE_F16, 10239, 512, 64 };
+    check(probe_unallocated(dev, f16_under, /*with_dummy=*/true), "F16 10239x512 placed: 10484736 bytes of fp16 padded input, under the default 10240 KB");
+    const mul_mat_case f16_at = { GGML_TYPE_F16, 512, 10240, 64 };
+    check(!probe_unallocated(dev, f16_at, /*with_dummy=*/true), "F16 512x10240 refused at placement: 10 MiB of fp16 padded output reaches the default 10240 KB");
+    // the two shapes of Qwen3-4B the default sits between, quantized like the file's: the FFN
+    // is the largest padded IO that has run on the device, the output layer has never run
+    const mul_mat_case ffn = { GGML_TYPE_Q4_K, 2560, 9728, 64 };
+    check(probe_unallocated(dev, ffn, /*with_dummy=*/true), "Q4_K 2560x9728 placed: 9.5 MiB of fp16 padded output");
+    const mul_mat_case out_layer = { GGML_TYPE_Q6_K, 2560, 151936, 64 };
+    check(!probe_unallocated(dev, out_layer, /*with_dummy=*/true), "Q6_K 2560x151936 refused at placement: 148.4 MiB of fp16 padded output");
+
+    // fp32 graph IO has the default 1 MiB cap: an F32 512x128 weight at the same bucket is
     // exactly 1 MiB in, a policy refusal taken before graphCreate
     const mul_mat_case f32_capped = { GGML_TYPE_F32, 512, 128, 64 };
     check(!probe_claim(qnn, f32_capped), "F32 512x128 N=64 refused: 1 MiB of fp32 padded input reaches the default GGML_QNN_IO_MAX_KB");
@@ -1433,8 +1451,9 @@ static int scenario_loadprobe(void) {
     // decide: 512x128 at N=513 would pad to 1024 (exactly 1 MiB in) and is still placed, as it
     // is 512 KiB at the smallest bucket. (at 4 bytes per element that pair was 256x128; at 2 it
     // fits at both buckets and could not tell them apart). both need the cap SET, as main does:
-    // unset, it covers fp32 graph IO only, so neither F16 weight is capped at any bucket: the
-    // first check would fail and the second pass without testing the bucket choice at all
+    // unset, the default for fp16 graph IO is 10 MiB, which neither F16 weight reaches at
+    // either bucket: the first check would fail and the second pass without testing the
+    // bucket choice at all
     const mul_mat_case placed_capped = { GGML_TYPE_F16, 1024, 128, 64 };
     check(!probe_unallocated(dev, placed_capped, /*with_dummy=*/true),
           "F16 1024x128 weight refused at placement: capped even at the smallest bucket");
@@ -2388,23 +2407,23 @@ static int scenario_quantized(void) {
 // main sets malformed values: GGML_QNN_NPAD=abc, GGML_QNN_MIN_DIM=-5 (below its floor of 1),
 // GGML_QNN_IO_MAX_KB=12k (a partial number). each must fall back to its default, with a warning,
 // rather than take a partial parse: 12k read as 12 would refuse every matmul, abc read as 0
-// would move every graph to the exact-pow2 bucket. for the cap the default is also a scope: a
-// malformed value counts as unset, so it caps fp32 graph IO only, not the fp16 IO a set value
-// would cap too
+// would move every graph to the exact-pow2 bucket. for the cap the default is two numbers: a
+// malformed value counts as unset, so fp32 graph IO is capped at 1 MiB and fp16 graph IO at
+// 10 MiB, not at the one size a set value gives both
 static int scenario_envparse(void) {
     printf("scenario: envparse (GGML_QNN_NPAD=abc, GGML_QNN_MIN_DIM=-5, GGML_QNN_IO_MAX_KB=12k)\n");
     ggml_backend_t qnn = qnn_backend_init_checked();
 
     const mul_mat_case rows16 = { GGML_TYPE_F32, 256, 128, 16 };
     check(!probe_claim(qnn, rows16), "N=16 refused: the default GGML_QNN_MIN_DIM of 32 applies");
-    // padded to the default 512 bucket: 512 KiB in, 256 KiB out, under the default 1 MiB cap,
-    // which covers this F32 weight's fp32 graph IO
+    // padded to the default 512 bucket: 512 KiB in, 256 KiB out, under the default 1 MiB cap
+    // of this F32 weight's fp32 graph IO
     const mul_mat_case under = { GGML_TYPE_F32, 256, 128, 64 };
     check(probe_claim(qnn, under), "256x128 N=64 claimed: 512 KiB of padded IO is under the default GGML_QNN_IO_MAX_KB");
     // an F16 weight at the same bucket: fp16 graph IO, 1 MiB in, which a set 1024 (or the 12
-    // of a partial parse) refuses and the unset default does not cover
+    // of a partial parse) refuses and the unset default for fp16 graph IO, 10 MiB, does not
     const mul_mat_case f16_1mib = { GGML_TYPE_F16, 1024, 128, 64 };
-    check(probe_claim(qnn, f16_1mib), "F16 1024x128 N=64 claimed: 12k counts as unset, and the unset cap does not cover fp16 graph IO");
+    check(probe_claim(qnn, f16_1mib), "F16 1024x128 N=64 claimed: 12k counts as unset, and 1 MiB is under the unset default for fp16 graph IO");
 
     ggml_backend_free(qnn);
     check_stat("graphs_created", 2, "the two claimed cases only, the N=16 one was refused before any build");
@@ -2473,15 +2492,17 @@ int main(int argc, char ** argv) {
     if (mode == "basic") {
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_NPAD", "512"); // the scenario's shapes are laid out around this bucket
-        // set, so the cap covers fp16 graph IO too: the scenario's refusal is an fp16-IO graph
+        // set, so fp16 graph IO is capped at 1 MiB too: the scenario's refusal is an fp16-IO
+        // graph of that size, which the unset default of 10 MiB passes
         set_env("GGML_QNN_IO_MAX_KB", "1024");
     } else if (mode == "bigstatic") {
         set_env("GGML_QNN_MIN_DIM", "1");
         // the diagnostic exists to reach the padded-IO hang thresholds that GGML_QNN_IO_MAX_KB
-        // refuses ahead of time. unset, the cap no longer covers these fp16-IO cases, but a
-        // caller's GGML_QNN_NO_F16_IO makes their IO fp32 (every 512-class case is then exactly
-        // 1 MiB in at the default bucket) and the default caps that: lift it unless the caller
-        // set one
+        // refuses ahead of time. unset, the 10 MiB default for fp16 graph IO passes these cases
+        // at the default bucket (the largest is 2.5 MiB) but not at every GGML_QNN_NPAD a
+        // caller can set, and a caller's GGML_QNN_NO_F16_IO makes their IO fp32 (every
+        // 512-class case is then exactly 1 MiB in at the default bucket), which the fp32
+        // default caps: lift it unless the caller set one
         if (!getenv("GGML_QNN_IO_MAX_KB")) {
             set_env("GGML_QNN_IO_MAX_KB", "1048576");
         }
@@ -2585,9 +2606,11 @@ int main(int argc, char ** argv) {
         enable_stats();
         // the default, pinned because the scenario's IO-cap cases are computed for this bucket
         set_env("GGML_QNN_NPAD", "512");
-        // set, so the cap covers fp16 graph IO too: the placement cases are F16 weights, and
-        // unset the cap would not refuse them at any bucket
-        set_env("GGML_QNN_IO_MAX_KB", "1024");
+        // set, so fp16 graph IO is capped at 1 MiB too: the placement cases are F16 weights,
+        // which the unset default of 10 MiB would not refuse. the space after the number is
+        // what cmd.exe's "set GGML_QNN_IO_MAX_KB=1024 && prog" leaves: it must still count as
+        // set, a value read as malformed counts as unset and the placement refusal is lost
+        set_env("GGML_QNN_IO_MAX_KB", "1024 ");
     } else if (mode == "elementwise-on") {
         enable_stats();
         set_env("GGML_QNN_MIN_ELEMENTS", "65536"); // keeps the ADD trial at 256 KiB IO, see the scenario
