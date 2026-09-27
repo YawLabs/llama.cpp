@@ -106,6 +106,48 @@ kernel void kernel_get_rows_f32(
     }
 }
 
+// i32 rows (sampler candidate ids). An int copy, not the f32 kernel: a float move need not keep
+// the bits of an int that reads as a subnormal float
+kernel void kernel_get_rows_i32(
+        global void * src0,
+        ulong offset0,
+        global int * src1,
+        ulong offset1,
+        global int * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global void*)((global char*)src0 + offset0);
+    src1 = (global int*)((global char*)src1 + offset1);
+    dst = (global int*)((global char*)dst + offsetd);
+
+    int i10 = get_group_id(0);
+    int i11 = get_group_id(1);
+    int i12 = get_group_id(2);
+
+    int r = ((global int *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
+
+    int i02 = i11;
+    int i03 = i12;
+
+    global int * dst_row = (global int *) ((global char *) dst  + i12*nb3 + i11*nb2 + i10*nb1);
+    global int * src_row = (global int *) ((global char *) src0 + r*nb01 + i02*nb02 + i03*nb03);
+
+    for (int ind = get_local_id(0); ind < ne00; ind += get_local_size(0)) {
+        dst_row[ind] = src_row[ind];
+    }
+}
+
 kernel void kernel_get_rows_f16(
         global void * src0,
         ulong offset0,

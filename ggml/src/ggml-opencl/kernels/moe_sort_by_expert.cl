@@ -1,11 +1,14 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+// ids_stride is the row stride of the routing ids in elements: n_experts when they are a
+// view of the [n_experts, N] top-k argsort, topK when they are compact.
 __kernel void kernel_moe_histogram(
     __global const int * input,
     __global int * hist,
     uint N,
     uint topK,
-    uint n_experts
+    uint n_experts,
+    uint ids_stride
 ) {
     uint n = get_global_id(0);
     uint k = get_global_id(1);
@@ -14,7 +17,7 @@ __kernel void kernel_moe_histogram(
         return;
     }
 
-    int expert_id = input[n * n_experts + k];
+    int expert_id = input[n * ids_stride + k];
     atomic_inc(&hist[expert_id]);
 }
 
@@ -47,7 +50,8 @@ __kernel void kernel_moe_scatter(
     __global int * slot_counter,
     int N,
     int topK,
-    uint n_experts
+    uint n_experts,
+    uint ids_stride
 ) {
     uint n = get_global_id(0);
     uint k = get_global_id(1);
@@ -56,7 +60,7 @@ __kernel void kernel_moe_scatter(
         return;
     }
 
-    int val = input[n * n_experts + k];
+    int val = input[n * ids_stride + k];
 
     int local_slot = atomic_inc(&slot_counter[val]);
 
@@ -89,7 +93,8 @@ __kernel void kernel_moe_scatter_stable(
     __global const int * tile_offset,
     int N,
     int topK,
-    uint n_experts
+    uint n_experts,
+    uint ids_stride
 ) {
     const int e   = get_group_id(1);
     const int lid = get_local_id(0);
@@ -110,7 +115,7 @@ __kernel void kernel_moe_scatter_stable(
         if (j < M) {
             const int n = j / topK;
             const int k = j - n * topK;
-            pred = (input[n * (int)n_experts + k] == e) ? 1 : 0;
+            pred = (input[n * (int)ids_stride + k] == e) ? 1 : 0;
         }
 
         scan[lid] = pred;

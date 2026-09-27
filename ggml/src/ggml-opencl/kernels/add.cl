@@ -135,20 +135,22 @@ kernel void kernel_add_f16(
     for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
         const int i10 = i0 % ne10;
 
-        half v0, v1;
+        // add in f32 and round to f16 once, as the CPU does: narrowing an f32 operand
+        // to f16 first rounds twice
+        float v0, v1;
         if (type_src0 == 1) {
-            v0 = convert_half(*((global float *)(src0_ptr + i0*nb00)));
+            v0 = *((global float *)(src0_ptr + i0*nb00));
         } else {
-            v0 = *((global half *)(src0_ptr + i0*nb00));
+            v0 = convert_float(*((global half *)(src0_ptr + i0*nb00)));
         }
 
         if (type_src1 == 1) {
-            v1 = convert_half(*((global float *)(src1_ptr + i10*nb10)));
+            v1 = *((global float *)(src1_ptr + i10*nb10));
         } else {
-            v1 = *((global half *)(src1_ptr + i10*nb10));
+            v1 = convert_float(*((global half *)(src1_ptr + i10*nb10)));
         }
 
-        *((global half *)(dst_ptr + i0*nb0)) = v0 + v1;
+        *((global half *)(dst_ptr + i0*nb0)) = convert_half(v0 + v1);
     }
 }
 
@@ -169,22 +171,23 @@ kernel void kernel_add_row_f16(
     uint gid = get_global_id(0);
     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
 
-    half4 v0, v1;
+    // add in f32 and round to f16 once (see kernel_add_f16)
+    float4 v0, v1;
     if (type_src0 == 1) {
         global float4* src0_f32 = (global float4*)((global char*)src0 + offset0);
-        v0 = convert_half4(src0_f32[gid]);
+        v0 = src0_f32[gid];
     } else {
         global half4* src0_f16 = (global half4*)((global char*)src0 + offset0);
-        v0 = src0_f16[gid];
+        v0 = convert_float4(src0_f16[gid]);
     }
 
     if (type_src1 == 1) {
         global float4* src1_f32 = (global float4*)((global char*)src1 + offset1);
-        v1 = convert_half4(src1_f32[idx1]);
+        v1 = src1_f32[idx1];
     } else {
         global half4* src1_f16 = (global half4*)((global char*)src1 + offset1);
-        v1 = src1_f16[idx1];
+        v1 = convert_float4(src1_f16[idx1]);
     }
 
-    dst[gid] = v0 + v1;
+    dst[gid] = convert_half4(v0 + v1);
 }

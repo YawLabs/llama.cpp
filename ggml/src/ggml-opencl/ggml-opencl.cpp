@@ -720,6 +720,10 @@ struct ggml_backend_opencl_context {
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
+    // argsort / top-k scratch for rows longer than a workgroup: indices and values. Argsort uses
+    // [0] for [npad * nrows]; the top-k reduction passes alternate between [0] and [1].
+    ggml_cl_buffer prealloc_sort_idx[2];
+    ggml_cl_buffer prealloc_sort_val[2];
 
     // pool of persistent image1d_buffer views over kv-cache layers, keyed by
     // (parent buffer, offset within parent)
@@ -811,6 +815,7 @@ struct ggml_backend_opencl_context {
     cl_program program_softmax_4_f16;
     cl_program program_argsort_f32_i32;
     cl_program program_sum_rows_f32;
+    cl_program program_argmax_f32;
     cl_program program_pad;
     cl_program program_upscale;
     cl_program program_conv_2d_f16;
@@ -861,7 +866,7 @@ struct ggml_backend_opencl_context {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
 #endif
-    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
+    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_i32;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
     cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
@@ -870,6 +875,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
+    cl_kernel kernel_cpy_f32_i32, kernel_cpy_i32_f32;
     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
@@ -963,7 +969,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_solve_tri_f32;
     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
     cl_kernel kernel_argsort_f32_i32;
+    cl_kernel kernel_argsort_chunk_f32_i32, kernel_argsort_step_f32_i32, kernel_top_k_chunk_f32_i32;
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
+    cl_kernel kernel_argmax_f32;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
     cl_kernel kernel_pad;
@@ -986,6 +994,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_ceil_f32, kernel_ceil_f32_4, kernel_ceil_f32_nc, kernel_ceil_f16, kernel_ceil_f16_4, kernel_ceil_f16_nc;
     cl_kernel kernel_round_f32, kernel_round_f32_4, kernel_round_f32_nc, kernel_round_f16, kernel_round_f16_4, kernel_round_f16_nc;
     cl_kernel kernel_trunc_f32, kernel_trunc_f32_4, kernel_trunc_f32_nc, kernel_trunc_f16, kernel_trunc_f16_4, kernel_trunc_f16_nc;
+    cl_kernel kernel_log_f32, kernel_log_f32_4, kernel_log_f32_nc, kernel_log_f16, kernel_log_f16_4, kernel_log_f16_nc;
     cl_kernel kernel_softplus_f32, kernel_softplus_f32_4, kernel_softplus_f32_nc;
     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
     cl_kernel kernel_upscale;
@@ -1459,6 +1468,9 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_argsort_chunk_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_chunk_f32_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_argsort_step_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_step_f32_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_top_k_chunk_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_top_k_chunk_f32_i32", &err), err));
         backend_ctx->kernels_loaded_argsort = true;
     }
 }
@@ -1626,6 +1638,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             }
         }
         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_f32_i32 = clCreateKernel(prog, "kernel_cpy_f32_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_i32_f32 = clCreateKernel(prog, "kernel_cpy_i32_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1816,6 +1830,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_get_rows_f32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_get_rows_i32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_i32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3077,6 +3092,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // argmax
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "argmax.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("argmax.cl");
+#endif
+        // no finite-math options: sampler logits hold -inf for masked tokens
+        std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable ";
+
+        backend_ctx->program_argmax_f32 =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_argmax_f32 = clCreateKernel(backend_ctx->program_argmax_f32, "kernel_argmax_f32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
     // cumsum
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -3271,7 +3305,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // unary_ext (sgn, step, elu, hardswish, hardsigmoid, floor, ceil, round, trunc)
+    // unary_ext (sgn, step, elu, hardswish, hardsigmoid, floor, ceil, round, trunc, log)
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -3298,6 +3332,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_UNARY_EXT_K(ceil)
         CL_UNARY_EXT_K(round)
         CL_UNARY_EXT_K(trunc)
+        CL_UNARY_EXT_K(log)
 #undef CL_UNARY_EXT_K
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -8839,6 +8874,73 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+// the most device scratch one ARGSORT or TOP_K may take; beyond it the op stays on the CPU
+static const size_t GGML_CL_SORT_SCRATCH_MAX = 256ull << 20;
+
+// The scratch a sort op allocates beyond its dst, in bytes: its largest buffer and all of its buffers
+// together, both 0 when the op sorts in place. It lives in prealloc_sort_idx/prealloc_sort_val, outside
+// the scheduler's buffers. The sizes follow ggml_cl_argsort, ggml_cl_argsort_rows and ggml_cl_top_k,
+// so a change to their chunk or scratch sizes must change this too. Needs the argsort kernels loaded.
+static void ggml_cl_sort_scratch_size(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * op,
+                                      size_t * buf_size, size_t * total_size) {
+    const ggml_tensor * src0 = op->src[0];
+
+    const size_t ne00  = src0->ne[0];
+    const size_t nrows = ggml_nrows(src0);
+
+    *buf_size   = 0;
+    *total_size = 0;
+
+    if (op->op == GGML_OP_ARGSORT) {
+        // ggml_cl_argsort: a contiguous row that fits one workgroup takes the single-pass kernel
+        size_t ne00_padded = 1;
+        while (ne00_padded < ne00) {
+            ne00_padded *= 2;
+        }
+        if (ggml_is_contiguous(src0) &&
+            ne00_padded <= backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_argsort_f32_i32)) {
+            return;
+        }
+    } else {
+        // ggml_cl_top_k: a row of at most cs_max sorts in one pass, a small k takes the chunk passes
+        const int max_wg = MIN((int) backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_top_k_chunk_f32_i32), 512);
+        int nth_max = 1;
+        while (2*nth_max <= max_wg) {
+            nth_max *= 2;
+        }
+        const size_t cs_max = 2*nth_max;
+        size_t kpad = 1;
+        while (kpad < (size_t) op->ne[0]) {
+            kpad *= 2;
+        }
+        if (ne00 <= cs_max) {
+            return;
+        }
+        if (2*kpad <= cs_max) {
+            // an int and a float buffer for each of the two ping-pong passes
+            *buf_size   = ((ne00 + cs_max - 1)/cs_max) * kpad * nrows * sizeof(cl_int);
+            *total_size = 4 * *buf_size;
+            return;
+        }
+    }
+
+    // ggml_cl_argsort_rows: an int and a float buffer, used when a row spans more than one chunk
+    const int max_wg = MIN((int) backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_argsort_chunk_f32_i32), 512);
+    size_t npad = 2;
+    while (npad < ne00) {
+        npad *= 2;
+    }
+    size_t nth = 1;
+    while (2*nth <= (size_t) max_wg && 4*nth <= npad) {
+        nth *= 2;
+    }
+    const size_t cs = 2*nth;
+    if (npad > cs) {
+        *buf_size   = npad * nrows * sizeof(cl_int);
+        *total_size = 2 * *buf_size;
+    }
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -8855,6 +8957,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             switch (op->src[0]->type) {
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
+                case GGML_TYPE_I32:
                     return true;
                 case GGML_TYPE_Q4_0:
 #ifdef GGML_OPENCL_SOA_Q
@@ -8892,6 +8995,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     switch (op->type) {
                         case GGML_TYPE_F16:
                         case GGML_TYPE_F32:
+                        case GGML_TYPE_I32:
                             return true;
                         default:
                             return false;
@@ -8907,6 +9011,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 case GGML_TYPE_I32:
                     switch (op->type) {
                         case GGML_TYPE_I32:
+                        case GGML_TYPE_F32:
                             return true;
                         default:
                             return false;
@@ -8941,6 +9046,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_SQRT:
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                     ggml_is_contiguous(op->src[0]);
+        case GGML_OP_LOG:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                    op->type == op->src[0]->type;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_GELU:
@@ -9015,16 +9123,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                    (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) && !antialias;
         }
         case GGML_OP_CONV_2D:
-            // The kernel walks both operands as if they were contiguous WHCN, so a
-            // channel-most-contiguous (CWHN) input or kernel -- which reaches us as a permuted,
-            // non-contiguous tensor with the same ne -- is read with the wrong strides and
-            // produces garbage rather than being declined. Decline non-contiguous layouts, as
-            // the CUDA and Vulkan backends already do.
-            // Drop this gate when rebasing past upstream #28503 (7d701b592), which passes the nb00/nb10 strides to the kernel.
-            return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op)) &&
-                   ((op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
-                    (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
-                    (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32));
+            return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                   (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
+                   (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_SSM_CONV:
             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_SSM_SCAN: {
@@ -9117,11 +9218,29 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return op->src[1]->type == GGML_TYPE_F32;
             }
             return false;
-        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID: {
+            // GGML_PREC_F32 on src1 (the graph sets it when the activations can exceed the f16
+            // range, e.g. Mistral4's ffn_moe_down) rules out the Adreno MoE GEMMs that run for
+            // more than one token: the *_f32_ns kernels narrow src1 to f16 and accumulate in f16,
+            // and the dp4a kernels quantize it to q8_1 with f16 scales and block sums
+            // (kernel_moe_reorder_quant_a_q8_1), so large activations overflow to inf and NaN.
+            // The one-token MoE GEMVs and the general mul_mv_id kernels keep src1 in f32.
+            bool moe_gemm_narrows_src1 = false;
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            moe_gemm_narrows_src1 = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32 &&
+                                    op->src[1]->ne[2] > 1 &&
+                                    use_adreno_moe_kernels(backend_ctx, op->src[0]);
+#endif
             if (op->src[0]->type == GGML_TYPE_Q4_0 ||
                 op->src[0]->type == GGML_TYPE_Q8_0 ||
                 op->src[0]->type == GGML_TYPE_MXFP4) {
                 if (op->src[1]->type == GGML_TYPE_F32) {
+                    // set_tensor repacks q4_0 and mxfp4 MoE weights for the Adreno MoE kernels, so the
+                    // general kernel cannot take them over; q8_0 keeps its layout, and
+                    // ggml_cl_mul_mat_id sends it to the general kernel instead
+                    if (moe_gemm_narrows_src1 && op->src[0]->type != GGML_TYPE_Q8_0) {
+                        return false;
+                    }
                     return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                 }
             }
@@ -9136,6 +9255,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
                 if (op->src[1]->type == GGML_TYPE_F32) {
                     return use_adreno_moe_kernels(backend_ctx, op->src[0])
+                        && !moe_gemm_narrows_src1
                         && ggml_is_contiguous(op->src[0])
                         && ggml_is_contiguous(op->src[1]);
                 }
@@ -9143,6 +9263,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return false;
             }
             return false;
+        }
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
@@ -9176,22 +9297,28 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_IM2COL:
             return true;
-        case GGML_OP_ARGSORT: {
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K: {
+            // rows longer than a workgroup, and strided rows, take the multi-pass sort; its
+            // padded row length is an int power of two
             load_cl_kernels_argsort(backend_ctx);
-
-            cl_kernel kernel = backend_ctx->kernel_argsort_f32_i32;
-            int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
-
-            int cols = 1;
-            while (cols < op->ne[0]) {
-                cols *= 2;
+            if (op->src[0]->type != GGML_TYPE_F32 || op->src[0]->nb[0] != sizeof(float) ||
+                op->src[0]->ne[0] > (1 << 30)) {
+                return false;
             }
-
-            return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
+            // the multi-pass scratch is allocated outside the scheduler and a failed allocation
+            // aborts, so a sort whose scratch is too large stays on the CPU
+            size_t buf_size;
+            size_t total_size;
+            ggml_cl_sort_scratch_size(backend_ctx, op, &buf_size, &total_size);
+            return buf_size <= backend_ctx->max_alloc_size && total_size <= GGML_CL_SORT_SCRATCH_MAX;
         }
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
+        case GGML_OP_SUM:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+        case GGML_OP_ARGMAX:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 && op->src[0]->nb[0] == sizeof(float);
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
@@ -9729,12 +9856,14 @@ struct ggml_backend_opencl_buffer_context {
     // Two types of tensors get SOA'ed - normal weights and MoE weights.
     // In Q8_0's case, we only have normal weights. If we ever have Q8_0 as MoE
     // weights, they need to be added to this set in `set_tensors`.
-    std::unordered_set<const ggml_tensor *> q8_0_soa_tensors;
+    // The key is the SoA extra, not the tensor: a struct copy of the tensor (gguf_write reads
+    // through one) carries the same extra, and views look up their view_src's extra.
+    std::unordered_set<const void *> q8_0_soa_tensors;
 
     // Same for q4_0. KV-cache q4_0 tensors are allocated but never pass
     // through set_tensor, so they stay AoS and aren't in this set.
     // In Q4_0's case, in addition to normal weights, we have MoE weights.
-    std::unordered_set<const ggml_tensor *> q4_0_soa_tensors;
+    std::unordered_set<const void *> q4_0_soa_tensors;
 
     // The buffer_context is initially created by ggml_backend_buft_alloc_buffer
     // before any tensor is initialized (at the beginning of alloc_tensor_range).
@@ -10151,7 +10280,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
             tensor->extra = extra;
             // MoE tensors are also SOA'ed
-            ctx->q4_0_soa_tensors.insert(tensor);
+            ctx->q4_0_soa_tensors.insert(tensor->extra);
 
             return;
         }
@@ -10180,7 +10309,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
-        ctx->q4_0_soa_tensors.insert(tensor);
+        ctx->q4_0_soa_tensors.insert(tensor->extra);
 
         // transpose the weights and scales
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -10821,7 +10950,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
-        ctx->q8_0_soa_tensors.insert(tensor);
+        ctx->q8_0_soa_tensors.insert(tensor->extra);
 
         // Generic dp4a MoE path (opt-in GGML_OPENCL_Q8_MOE_DP4A)
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -13464,6 +13593,9 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
         case GGML_TYPE_Q4_0:
             kernel = backend_ctx->kernel_get_rows_q4_0;
             break;
+        case GGML_TYPE_I32:
+            kernel = backend_ctx->kernel_get_rows_i32;
+            break;
         default:
             GGML_ASSERT(false && "not implemented");
     }
@@ -13516,7 +13648,7 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor) {
         return false;
     }
     const ggml_tensor * key = tensor->view_src != nullptr ? tensor->view_src : tensor;
-    return ctx->q8_0_soa_tensors.count(key) > 0;
+    return ctx->q8_0_soa_tensors.count(key->extra) > 0;
 }
 
 // check if a Q4_0 tensor has been SOA'ed in set_tensor
@@ -13530,7 +13662,7 @@ static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor) {
         return false;
     }
     const ggml_tensor * key = tensor->view_src != nullptr ? tensor->view_src : tensor;
-    return ctx->q4_0_soa_tensors.count(key) > 0;
+    return ctx->q4_0_soa_tensors.count(key->extra) > 0;
 }
 
 static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -16055,6 +16187,7 @@ GGML_CL_UNARY_EXT_WRAP(ggml_cl_floor,       floor)
 GGML_CL_UNARY_EXT_WRAP(ggml_cl_ceil,        ceil)
 GGML_CL_UNARY_EXT_WRAP(ggml_cl_round,       round)
 GGML_CL_UNARY_EXT_WRAP(ggml_cl_trunc,       trunc)
+GGML_CL_UNARY_EXT_WRAP(ggml_cl_log,         log)
 
 #undef GGML_CL_UNARY_EXT_WRAP
 
@@ -25739,7 +25872,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 }
 
-static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src, int ne20) {
+// n_experts is src0->ne[2]. It is not the row stride of the ids: that is n_experts only when
+// the ids are a view of the [n_experts, n_tokens] top-k argsort (as llama builds them), and
+// n_used for compact ids, which would otherwise size the histogram below the expert count.
+static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src, int ne20, int n_experts) {
     cl_int err;
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -25748,7 +25884,8 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
 
     const int ne21 = src->ne[1];
     const int nb21 = src->nb[1];
-    const int ne02 = nb21 / src->nb[0];
+    const int ids_stride = nb21 / src->nb[0];
+    const int ne02 = n_experts;
     const int n_tile_size = 32;
     const int max_post_router_tile = (ne20 * ne21 / n_tile_size) + ne02;
 
@@ -25801,6 +25938,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int), &ne21));
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int), &ne20));
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ids_stride));
 
     size_t histogram_global_size[] = {(size_t)(((ne21 + 63) / 64) * 64), static_cast<size_t>(ne20), 1};
     size_t histogram_local_size[] = {64, 1, 1};
@@ -25847,6 +25985,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &ne21));
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne20));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne02));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ids_stride));
 
         // one workgroup (one wave) per expert; each ranks its own tokens
         size_t scatter_global_size[] = {64, (size_t)ne02};
@@ -25862,6 +26001,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne21));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne20));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne02));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(int), &ids_stride));
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
     }
@@ -26084,7 +26224,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -26371,7 +26511,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -26554,7 +26694,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -26807,7 +26947,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -26929,7 +27069,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             const bool          moe_gemm_q8     = moe_gemm_q8_env
                 ? (atoi(moe_gemm_q8_env) != 0)
                 : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
-            if (moe_gemm_q8 && use_adreno_moe_kernels(backend_ctx, src0) && ne12 > 1) {
+            // the MoE GEMM narrows src1 to f16 or q8_1, which GGML_PREC_F32 on src1 rules out (see
+            // supports_op); q8_0 weights keep their general layout, so the general kernel below takes it
+            const bool src1_prec_f32 = ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
+            if (moe_gemm_q8 && use_adreno_moe_kernels(backend_ctx, src0) && ne12 > 1 && !src1_prec_f32) {
                 cl_int status;
 
                 size_t local_size[3]  = {64, 2, 1};
@@ -26938,7 +27081,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 kernel = backend_ctx->kernel_gemm_moe_q8_0_f32_ns;
 
                 if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                    moe_router_reoerder(backend, src2, ne20);
+                    moe_router_reoerder(backend, src2, ne20, ne02);
                     backend_ctx->toggle_reorder = false;
                 }
 
@@ -27255,7 +27398,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -27505,7 +27648,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -27764,7 +27907,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -28023,7 +28166,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                        moe_router_reoerder(backend, src2, ne20, ne02);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -28435,6 +28578,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
                     kernel = ne00 < 32 ? backend_ctx->kernel_cpy_f32_f32_pack
                                        : backend_ctx->kernel_cpy_f32_f32;
                     break;
+                case GGML_TYPE_I32:
+                    kernel = backend_ctx->kernel_cpy_f32_i32;
+                    break;
                 default:
                     GGML_ASSERT(false && "not implemented");
             }
@@ -28455,6 +28601,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
             switch (src1t) {
                 case GGML_TYPE_I32:
                     kernel = backend_ctx->kernel_cpy_i32_i32;
+                    break;
+                case GGML_TYPE_F32:
+                    kernel = backend_ctx->kernel_cpy_i32_f32;
                     break;
                 default:
                     GGML_ASSERT(false && "not implemented");
@@ -29169,6 +29318,229 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// Sort each row of src0 and write the first n_out indices of each row to dst: argsort (n_out = ne00)
+// and top-k (n_out = k, descending) for rows of any length. See kernel_argsort_chunk_f32_i32.
+static void ggml_cl_argsort_rows(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst, int order, int n_out) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst));
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int      ne00  = src0->ne[0];
+    const int      ne01  = src0->ne[1];
+    const int      ne02  = src0->ne[2];
+    const cl_ulong nb01  = src0->nb[1];
+    const cl_ulong nb02  = src0->nb[2];
+    const cl_ulong nb03  = src0->nb[3];
+    const int      nrows = ggml_nrows(src0);
+
+    int npad = 2;
+    while (npad < ne00) {
+        npad *= 2;
+    }
+
+    cl_kernel k_chunk = backend_ctx->kernel_argsort_chunk_f32_i32;
+    cl_kernel k_step  = backend_ctx->kernel_argsort_step_f32_i32;
+
+    // a chunk is 2 x the local size, and no more than the padded row
+    const int max_wg = MIN((int) backend_ctx->get_kernel_workgroup_size(k_chunk), 512);
+    int nth = 1;
+    while (2*nth <= max_wg && 4*nth <= npad) {
+        nth *= 2;
+    }
+    const int cs = 2*nth;
+
+    // the scratch is only read when a row spans more than one chunk
+    cl_mem sidx = extrad->data_device;
+    cl_mem sval = extrad->data_device;
+    if (npad > cs) {
+        const size_t n = (size_t) npad * nrows;
+        backend_ctx->prealloc_sort_idx[0].allocate(backend_ctx->context, n*sizeof(cl_int));
+        backend_ctx->prealloc_sort_val[0].allocate(backend_ctx->context, n*sizeof(cl_float));
+        sidx = backend_ctx->prealloc_sort_idx[0].buffer;
+        sval = backend_ctx->prealloc_sort_val[0].buffer;
+    }
+
+    CL_CHECK(clSetKernelArg(k_chunk,  0, sizeof(cl_mem),        &extra0->data_device));
+    CL_CHECK(clSetKernelArg(k_chunk,  1, sizeof(cl_ulong),      &offset0));
+    CL_CHECK(clSetKernelArg(k_chunk,  2, sizeof(cl_mem),        &sidx));
+    CL_CHECK(clSetKernelArg(k_chunk,  3, sizeof(cl_mem),        &sval));
+    CL_CHECK(clSetKernelArg(k_chunk,  4, sizeof(cl_mem),        &extrad->data_device));
+    CL_CHECK(clSetKernelArg(k_chunk,  5, sizeof(cl_ulong),      &offsetd));
+    CL_CHECK(clSetKernelArg(k_chunk,  6, sizeof(int),           &ne00));
+    CL_CHECK(clSetKernelArg(k_chunk,  7, sizeof(int),           &npad));
+    CL_CHECK(clSetKernelArg(k_chunk,  8, sizeof(int),           &n_out));
+    CL_CHECK(clSetKernelArg(k_chunk,  9, sizeof(int),           &ne01));
+    CL_CHECK(clSetKernelArg(k_chunk, 10, sizeof(int),           &ne02));
+    CL_CHECK(clSetKernelArg(k_chunk, 11, sizeof(cl_ulong),      &nb01));
+    CL_CHECK(clSetKernelArg(k_chunk, 12, sizeof(cl_ulong),      &nb02));
+    CL_CHECK(clSetKernelArg(k_chunk, 13, sizeof(cl_ulong),      &nb03));
+    CL_CHECK(clSetKernelArg(k_chunk, 14, sizeof(int),           &order));
+    CL_CHECK(clSetKernelArg(k_chunk, 17, cs*sizeof(cl_int),     NULL));
+    CL_CHECK(clSetKernelArg(k_chunk, 18, cs*sizeof(cl_float),   NULL));
+
+    size_t chunk_gws[] = {(size_t)(npad/cs)*nth, (size_t)nrows, 1};
+    size_t chunk_lws[] = {(size_t)nth, 1, 1};
+
+    int k_lo = 2;
+    int k_hi = cs;
+    CL_CHECK(clSetKernelArg(k_chunk, 15, sizeof(int), &k_lo));
+    CL_CHECK(clSetKernelArg(k_chunk, 16, sizeof(int), &k_hi));
+    backend_ctx->enqueue_ndrange_kernel(k_chunk, 3, chunk_gws, chunk_lws, dst);
+
+    if (npad == cs) {
+        return;
+    }
+
+    CL_CHECK(clSetKernelArg(k_step, 0, sizeof(cl_mem), &sidx));
+    CL_CHECK(clSetKernelArg(k_step, 1, sizeof(cl_mem), &sval));
+    CL_CHECK(clSetKernelArg(k_step, 2, sizeof(int),    &ne00));
+    CL_CHECK(clSetKernelArg(k_step, 3, sizeof(int),    &npad));
+    CL_CHECK(clSetKernelArg(k_step, 4, sizeof(int),    &order));
+
+    const int max_wg_step = MIN((int) backend_ctx->get_kernel_workgroup_size(k_step), 256);
+    int lws_step = 1;
+    while (2*lws_step <= max_wg_step && 2*lws_step <= npad/2) {
+        lws_step *= 2;
+    }
+    size_t step_gws[] = {(size_t)npad/2, (size_t)nrows, 1};
+    size_t step_lws[] = {(size_t)lws_step, 1, 1};
+
+    for (int k = 2*cs; k <= npad; k *= 2) {
+        for (int j = k/2; j >= cs; j /= 2) {
+            CL_CHECK(clSetKernelArg(k_step, 5, sizeof(int), &k));
+            CL_CHECK(clSetKernelArg(k_step, 6, sizeof(int), &j));
+            backend_ctx->enqueue_ndrange_kernel(k_step, 3, step_gws, step_lws, dst);
+        }
+        CL_CHECK(clSetKernelArg(k_chunk, 15, sizeof(int), &k));
+        CL_CHECK(clSetKernelArg(k_chunk, 16, sizeof(int), &k));
+        backend_ctx->enqueue_ndrange_kernel(k_chunk, 3, chunk_gws, chunk_lws, dst);
+    }
+}
+
+static void ggml_cl_top_k(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_UNUSED(src1);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst));
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    const int k    = dst->ne[0];
+    const int ne00 = src0->ne[0];
+
+    cl_kernel kernel = backend_ctx->kernel_top_k_chunk_f32_i32;
+
+    // chunks of cs entries, and a pass keeps kpad of each, so a pass shrinks the row while kpad <= cs/2
+    const int max_wg = MIN((int) backend_ctx->get_kernel_workgroup_size(kernel), 512);
+    int nth_max = 1;
+    while (2*nth_max <= max_wg) {
+        nth_max *= 2;
+    }
+    const int cs_max = 2*nth_max;
+    int kpad = 1;
+    while (kpad < k) {
+        kpad *= 2;
+    }
+
+    // a large k takes the full sort
+    if (ne00 > cs_max && 2*kpad > cs_max) {
+        ggml_cl_argsort_rows(backend, src0, dst, GGML_SORT_ORDER_DESC, k);
+        return;
+    }
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int      ne01  = src0->ne[1];
+    const int      ne02  = src0->ne[2];
+    const cl_ulong nb01  = src0->nb[1];
+    const cl_ulong nb02  = src0->nb[2];
+    const cl_ulong nb03  = src0->nb[3];
+    const int      nrows = ggml_nrows(src0);
+
+    // the first pass has the most chunks, so its output bounds every scratch
+    if (ne00 > cs_max) {
+        const size_t n = (size_t) ((ne00 + cs_max - 1)/cs_max) * kpad * nrows;
+        for (int i = 0; i < 2; ++i) {
+            backend_ctx->prealloc_sort_idx[i].allocate(backend_ctx->context, n*sizeof(cl_int));
+            backend_ctx->prealloc_sort_val[i].allocate(backend_ctx->context, n*sizeof(cl_float));
+        }
+    }
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &k));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &kpad));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb03));
+
+    int n_in      = ne00;
+    int in_stride = 0;
+    int cur       = 0;
+    for (int first = 1; ; first = 0) {
+        // the last pass sorts the whole remaining row in one chunk
+        int cs = cs_max;
+        if (n_in <= cs_max) {
+            cs = 2;
+            while (cs < n_in) {
+                cs *= 2;
+            }
+        }
+        const int nchunks    = (n_in + cs - 1)/cs;
+        const int last       = nchunks == 1;
+        const int out_stride = nchunks*kpad;
+
+        // unused buffers of a pass get the dst buffer, a valid cl_mem the kernel does not read
+        cl_mem in_idx  = first ? extrad->data_device : backend_ctx->prealloc_sort_idx[cur ^ 1].buffer;
+        cl_mem in_val  = first ? extrad->data_device : backend_ctx->prealloc_sort_val[cur ^ 1].buffer;
+        cl_mem out_idx = last  ? extrad->data_device : backend_ctx->prealloc_sort_idx[cur].buffer;
+        cl_mem out_val = last  ? extrad->data_device : backend_ctx->prealloc_sort_val[cur].buffer;
+
+        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem), &in_idx));
+        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem), &in_val));
+        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem), &out_idx));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem), &out_val));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),    &n_in));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),    &in_stride));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),    &out_stride));
+        CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),    &first));
+        CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),    &last));
+        CL_CHECK(clSetKernelArg(kernel, 21, cs*sizeof(cl_int),   NULL));
+        CL_CHECK(clSetKernelArg(kernel, 22, cs*sizeof(cl_float), NULL));
+
+        size_t global_work_size[] = {(size_t)nchunks*(cs/2), (size_t)nrows, 1};
+        size_t local_work_size[]  = {(size_t)(cs/2), 1, 1};
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        if (last) {
+            break;
+        }
+        n_in      = out_stride;
+        in_stride = out_stride;
+        cur      ^= 1;
+    }
+}
+
 static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -29178,7 +29550,6 @@ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, co
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(src0));
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -29200,19 +29571,24 @@ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, co
 
     cl_kernel kernel = backend_ctx->kernel_argsort_f32_i32;
 
-    CL_CHECK(clSetKernelArg(kernel,   0, sizeof(cl_mem),            &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,   1, sizeof(cl_ulong),          &offset0));
-    CL_CHECK(clSetKernelArg(kernel,   2, sizeof(cl_mem),            &extrad->data_device));
-    CL_CHECK(clSetKernelArg(kernel,   3, sizeof(cl_ulong),          &offsetd));
-    CL_CHECK(clSetKernelArg(kernel,   4, sizeof(int),               &ne00));
-    CL_CHECK(clSetKernelArg(kernel,   5, sizeof(int),               &ne00_padded));
-    CL_CHECK(clSetKernelArg(kernel,   6, sizeof(int),               &order));
-    CL_CHECK(clSetKernelArg(kernel,   7, ne00_padded*sizeof(int),   NULL));
+    // the single-pass kernel holds a whole contiguous row in one workgroup
+    if (!ggml_is_contiguous(src0) || ne00_padded > (int) backend_ctx->get_kernel_workgroup_size(kernel)) {
+        ggml_cl_argsort_rows(backend, src0, dst, order, ne00);
+    } else {
+        CL_CHECK(clSetKernelArg(kernel,   0, sizeof(cl_mem),            &extra0->data_device));
+        CL_CHECK(clSetKernelArg(kernel,   1, sizeof(cl_ulong),          &offset0));
+        CL_CHECK(clSetKernelArg(kernel,   2, sizeof(cl_mem),            &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel,   3, sizeof(cl_ulong),          &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,   4, sizeof(int),               &ne00));
+        CL_CHECK(clSetKernelArg(kernel,   5, sizeof(int),               &ne00_padded));
+        CL_CHECK(clSetKernelArg(kernel,   6, sizeof(int),               &order));
+        CL_CHECK(clSetKernelArg(kernel,   7, ne00_padded*sizeof(int),   NULL));
 
-    size_t global_work_size[] = {(size_t)ne00_padded, (size_t)nrows, (size_t)1};
-    size_t local_work_size[] = {(size_t)ne00_padded, 1, 1};
+        size_t global_work_size[] = {(size_t)ne00_padded, (size_t)nrows, (size_t)1};
+        size_t local_work_size[] = {(size_t)ne00_padded, 1, 1};
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     const int ne21 = dst->ne[1];
@@ -29220,6 +29596,100 @@ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, co
         backend_ctx->toggle_reorder = true;
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+}
+
+// sum of every element: the sum_rows kernel over the tensor as one row
+static void ggml_cl_sum(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_UNUSED(src1);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0));
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int      ne00 = ggml_nelements(src0);
+    const int      ne01 = 1;
+    const cl_ulong nb01 = ggml_nbytes(src0);
+    const cl_ulong nb1  = ggml_type_size(dst->type);
+
+    // the float4 kernel reads the row through a float4 pointer
+    cl_kernel kernel = (ne00 % 4 == 0 && offset0 % 16 == 0) ? backend_ctx->kernel_sum_rows_f32_4 : backend_ctx->kernel_sum_rows_f32;
+
+    CL_CHECK(clSetKernelArg(kernel,   0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,   1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,   2, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,   3, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,   4, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,   5, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel,   6, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel,   7, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel,   8, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel,   9, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel,  10, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel,  11, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel,  12, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel,  13, sizeof(cl_ulong), &nb1));
+
+    size_t global_work_size[] = {64, 1, 1};
+    size_t local_work_size[] = {64, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_argmax(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_UNUSED(src1);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int      ne00 = src0->ne[0];
+    const int      ne01 = src0->ne[1];
+    const cl_ulong nb01 = src0->nb[1];
+
+    cl_kernel kernel = backend_ctx->kernel_argmax_f32;
+
+    // the kernel reduces in a tree, so the local size must be a power of two
+    const int max_wg = (int) backend_ctx->get_kernel_workgroup_size(kernel);
+    int nth = 1;
+    while (nth < ne00 && nth*2 <= max_wg && nth < 1024) {
+        nth *= 2;
+    }
+
+    CL_CHECK(clSetKernelArg(kernel,   0, sizeof(cl_mem),     &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,   1, sizeof(cl_ulong),   &offset0));
+    CL_CHECK(clSetKernelArg(kernel,   2, sizeof(cl_mem),     &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,   3, sizeof(cl_ulong),   &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,   4, sizeof(int),        &ne00));
+    CL_CHECK(clSetKernelArg(kernel,   5, sizeof(cl_ulong),   &nb01));
+    CL_CHECK(clSetKernelArg(kernel,   6, nth*sizeof(float),  NULL));
+    CL_CHECK(clSetKernelArg(kernel,   7, nth*sizeof(int),    NULL));
+
+    size_t global_work_size[] = {(size_t)nth * (size_t)ne01, 1, 1};
+    size_t local_work_size[] = {(size_t)nth, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
 static void ggml_cl_sum_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -29782,6 +30252,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
             }
             func = ggml_cl_sqrt;
             break;
+        case GGML_OP_LOG:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_log;
+            break;
         case GGML_OP_MEAN:
             if (!any_on_device) {
                 return false;
@@ -30075,6 +30551,24 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_argsort;
+            break;
+        case GGML_OP_TOP_K:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_top_k;
+            break;
+        case GGML_OP_SUM:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_sum;
+            break;
+        case GGML_OP_ARGMAX:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_argmax;
             break;
         case GGML_OP_SUM_ROWS:
             if (!any_on_device) {
