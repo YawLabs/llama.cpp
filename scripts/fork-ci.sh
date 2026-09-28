@@ -121,6 +121,35 @@ run_fork_tests() {
         --output-on-failure --no-tests=error
 }
 
+# -dev QNN must leave flash attention on: llama used to disable it for the whole model because
+# the op runs on the CPU while the layer's device is QNN (fixed in src/llama-context.cpp).
+# Nothing is baked (budget 1 MB): the decision depends on the device, not on what runs there.
+# No -fa: only "auto" is resolved, an explicit "on" would pass with the fix removed
+run_qnn_fused_ops() {
+    local dir="$1" log="$1/qnn-fused-ops.log" rc=0
+    say "flash attention under -dev QNN ($dir)"
+    if [ ! -f "$TEST_MODEL" ]; then
+        echo "note: skipped, TEST_MODEL does not exist: $TEST_MODEL"
+        skipped+=("flash attention under -dev QNN ($dir): no $TEST_MODEL")
+        return 0
+    fi
+    export QNN_SDK_ROOT
+    export ADSP_LIBRARY_PATH="$QNN_SDK_ROOT/lib/hexagon-v73/unsigned"
+    GGML_QNN_STATIC_BUDGET_MB=1 timeout 300 "$dir/bin/llama-completion" -m "$TEST_MODEL" -dev QNN \
+        -no-cnv -n 1 -p Hello -lv 4 > "$log" 2>&1 < /dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        tail -n 20 "$log"
+        echo "error: llama-completion -dev QNN exited $rc, full log in $log" >&2
+        return "$rc"
+    fi
+    if grep -q 'Flash Attention not supported, set to disabled' "$log"; then
+        echo "error: -dev QNN disabled flash attention, see $log" >&2
+        return 1
+    fi
+    # the positive line too, so a reworded upstream message fails here instead of passing
+    grep 'Flash Attention enabled' "$log" || { echo "error: no 'Flash Attention enabled' line in $log" >&2; return 1; }
+}
+
 # every op of one device against the CPU reference implementation, as upstream's ci/run.sh ran
 # test-backend-ops (its KleidiAI job with -b CPU): ~20k cases on the CPU (7 min), ~10k on the
 # GPU (6 min). The GPU gets one worker: every OpenCL backend instance shares one context (its
@@ -233,7 +262,10 @@ case "$mode" in
     npu|all)
         build_one "QNN / Hexagon NPU" build-npu \
             -DGGML_QNN=ON "-DQNN_SDK_ROOT=${QNN_SDK_ROOT}"
-        build_only || check run_fork_tests build-npu
+        if ! build_only; then
+            check run_fork_tests build-npu
+            check run_qnn_fused_ops build-npu
+        fi
         [ "$mode" = "all" ] || finish
         ;&
     gpu)
