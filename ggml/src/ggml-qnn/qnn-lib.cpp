@@ -65,6 +65,10 @@ static std::atomic<uint64_t> ggml_qnn_stat_exec_max_ms{0};
 // unset). io_shared == 0 alone cannot tell a machine without fastrpc from a broken rpcmem or
 // QnnMem_register path
 static std::atomic<uint64_t> ggml_qnn_stat_shm_selftest{3};
+// distinct weights the placement probe accepted, and distinct weights it refused for the
+// static budget, see ggml_qnn_placement_over_budget
+static std::atomic<uint64_t> ggml_qnn_stat_weights_placed{0};
+static std::atomic<uint64_t> ggml_qnn_stat_placement_budget_refused{0};
 
 // written on session teardown and on every degrade; counters are process-global and
 // monotonic, so with a refcounted session the last write is the cumulative total for the run
@@ -92,6 +96,8 @@ void ggml_qnn_stats_write(void) {
     fprintf(f, "exec_slow %" PRIu64 "\n", ggml_qnn_stat_exec_slow.load());
     fprintf(f, "exec_max_ms %" PRIu64 "\n", ggml_qnn_stat_exec_max_ms.load());
     fprintf(f, "shm_selftest %" PRIu64 "\n", ggml_qnn_stat_shm_selftest.load());
+    fprintf(f, "weights_placed %" PRIu64 "\n", ggml_qnn_stat_weights_placed.load());
+    fprintf(f, "placement_budget_refused %" PRIu64 "\n", ggml_qnn_stat_placement_budget_refused.load());
     fclose(f);
 }
 
@@ -949,8 +955,11 @@ static std::string ggml_qnn_graph_key(const ggml_tensor * node) {
 // the first refusal of the process is a WARN that names the way out: at the default
 // GGML_QNN_NPAD an F32 weight 512 or more wide and an F16 or quantized weight 10240 or more
 // wide are refused here (and, with the cap set to 1024, every weight of a 4B model), and at
-// DEBUG alone the user who asked for the NPU got a CPU run with no line saying why
-static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
+// DEBUG alone the user who asked for the NPU got a CPU run with no line saying why.
+// placement and schedule time have one notice each: a weight is placed at the smallest bucket
+// and a ubatch is judged at its own, so a -ub over the bucket is refused after the model
+// loaded, and the notice spent at load on the output layer left that one at DEBUG
+static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad, bool placement_probe) {
     struct io_cap {
         uint64_t bytes;     // 4-byte graph IO
         uint64_t bytes_f16; // fp16 graph IO
@@ -983,7 +992,7 @@ static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
     }
     static std::mutex                       logged_mutex;
     static std::unordered_set<std::string>  logged;
-    static bool                             warned = false;
+    static bool                             warned_at[2] = { false, false }; // schedule time, placement
     // the placement probe evaluates a pad that is not the node's own, so the pad is part of
     // the once-per-shape key
     const std::string shape_key = ggml_qnn_shape_key(node);
@@ -992,6 +1001,7 @@ static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
         GGML_LOG_DEBUG("ggml-qnn: %s: padded IO %" PRIu64 " in / %" PRIu64 " out bytes at N=%u reaches GGML_QNN_IO_MAX_KB, staying on the CPU\n",
                        shape_key.c_str(), in_bytes, out_bytes, pad);
     }
+    bool & warned = warned_at[placement_probe ? 1 : 0];
     if (!warned) {
         // the largest power-of-two batch whose padded IO still fits under the cap
         const uint64_t row_bytes = std::max<uint64_t>(node->src[1]->ne[0], node->src[0]->ne[1]) * elem;
@@ -1019,9 +1029,10 @@ static bool ggml_qnn_io_capped(const ggml_tensor * node, uint32_t pad) {
             // straight to stderr, like the first degrade: llama-bench without -v installs a null
             // log callback and would report a CPU run under the QNN backend name with no hint
             fprintf(stderr, "ggml-qnn: a %s %" PRId64 "x%" PRId64 " matmul stays on the CPU: its padded IO is %.1f MiB at N=%u, at or over the %.1f MiB cap "
-                            "(%s); GGML_QNN_NPAD=%u with -ub %u (or lower) fits it. later IO-cap refusals are logged at DEBUG\n",
+                            "(%s); GGML_QNN_NPAD=%u with -ub %u (or lower) fits it. later IO-cap refusals %s are logged at DEBUG\n",
                     ggml_type_name(node->src[0]->type), node->src[0]->ne[0], node->src[0]->ne[1],
-                    std::max(in_bytes, out_bytes) / (1024.0 * 1024.0), pad, cap_bytes / (1024.0 * 1024.0), cap_src, fit, fit);
+                    std::max(in_bytes, out_bytes) / (1024.0 * 1024.0), pad, cap_bytes / (1024.0 * 1024.0), cap_src, fit, fit,
+                    placement_probe ? "at model load" : "of a batch");
             fflush(stderr);
         }
     }
@@ -1041,7 +1052,7 @@ bool ggml_qnn_mul_mat_arith_reject(const ggml_tensor * op, bool placement_probe)
     // a padded IO buffer at or past the cap hung the execute on the mixed-dtype path (the
     // padded-IO size law); unset, fp16 graph IO has its own, larger default, see
     // ggml_qnn_io_capped
-    return ggml_qnn_io_capped(op, Nb);
+    return ggml_qnn_io_capped(op, Nb, placement_probe);
 }
 
 // policy checks that need no QNN graph. they must run BEFORE graphCreate: a rejected shape
@@ -1104,6 +1115,67 @@ static bool ggml_qnn_mul_mat_policy(ggml_qnn_session * sess, ggml_qnn_graph & g,
         return false;
     }
     return true;
+}
+
+// the placement ledger, see ggml_qnn_placement_over_budget in qnn-lib.h. the refused keys are
+// kept for the counter and the DEBUG line only, a refused weight is judged again when it
+// comes back
+static std::mutex                      ggml_qnn_placed_mutex;
+static std::unordered_set<std::string> ggml_qnn_placed;
+static std::unordered_set<std::string> ggml_qnn_placed_refused;
+static size_t                          ggml_qnn_placed_bytes = 0;
+
+bool ggml_qnn_placement_over_budget(const ggml_tensor * op) {
+    // no bake, no charge, see ggml_qnn_mul_mat_policy
+    if (!ggml_qnn_static_weights_on()) {
+        return false;
+    }
+    const ggml_tensor * w = op->src[0];
+
+    // the value ggml_qnn_session_init gets. from_env keeps an unusable one silent here, the
+    // session init reports it
+    bool from_env = false;
+    const size_t budget = (size_t) ggml_qnn_env_ll("GGML_QNN_STATIC_BUDGET_MB", 1024, 0, &from_env) * 1024 * 1024;
+    const size_t need   = ggml_qnn_static_bytes(w);
+
+    char key[GGML_MAX_NAME + 64];
+    snprintf(key, sizeof(key), "%s %s %" PRId64 "x%" PRId64, w->name, ggml_type_name(w->type), w->ne[0], w->ne[1]);
+
+    std::lock_guard<std::mutex> lock(ggml_qnn_placed_mutex);
+    if (ggml_qnn_placed.count(key) != 0) {
+        return false;
+    }
+    if (budget && ggml_qnn_placed_bytes + need > budget) {
+        if (ggml_qnn_placed_refused.insert(key).second) {
+            ggml_qnn_stat_placement_budget_refused.fetch_add(1);
+            GGML_LOG_DEBUG("ggml-qnn: %s: static weight needs %.1f MiB, %.1f of %.1f MiB placed, staying with the CPU\n",
+                           key, need / (1024.0 * 1024.0), ggml_qnn_placed_bytes / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
+        }
+        // stderr, like the budget refusal of a bake: llama-bench without -v drops the logger
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            fprintf(stderr, "ggml-qnn: the %.0f MiB static-weight budget has no room for %s (%.1f MiB) beside the %.1f MiB placed at model load in "
+                            "%zu weights: it and every later weight that does not fit stay with the CPU, repacked; GGML_QNN_STATIC_BUDGET_MB=<MiB> "
+                            "raises the budget (0 places every weight, and those the device then cannot map run on the CPU without repack, about "
+                            "1.8x slower than the default). later placement refusals are logged at DEBUG\n",
+                    budget / (1024.0 * 1024.0), w->name[0] ? w->name : "a weight without a name", need / (1024.0 * 1024.0),
+                    ggml_qnn_placed_bytes / (1024.0 * 1024.0), ggml_qnn_placed.size());
+            fflush(stderr);
+        }
+        return true;
+    }
+    ggml_qnn_placed.insert(key);
+    ggml_qnn_placed_bytes += need;
+    ggml_qnn_stat_weights_placed.fetch_add(1);
+    return false;
+}
+
+void ggml_qnn_placement_reset(void) {
+    std::lock_guard<std::mutex> lock(ggml_qnn_placed_mutex);
+    ggml_qnn_placed.clear();
+    ggml_qnn_placed_refused.clear();
+    ggml_qnn_placed_bytes = 0;
 }
 
 // stage the static weight in graph-owned memory, dequantizing a quantized source to fp16. QNN

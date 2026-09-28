@@ -1609,6 +1609,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // the output matmul runs at n_outputs rows (one per sequence in generation, the last token
+    // only in llama-bench's prompt test), under the batch a device that keeps its weights in host
+    // memory (the QNN backend) takes, so that device never runs it: placed there, the weight only
+    // left CPU_REPACK. selected from the CPU list it keeps the repack; the cost is that an
+    // all-logits run (llama-perplexity) never puts the output layer on such a device
+    if (ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(pimpl->dev_output.dev))) {
+        pimpl->dev_output.buft_list = &pimpl->cpu_buft_list;
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights

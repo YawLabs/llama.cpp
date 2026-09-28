@@ -211,8 +211,38 @@ bool ggml_qnn_mul_mat_type_claimable(enum ggml_type type);
 // NULL and src0->buffer is the zero-size dummy), whose N is fictitious: there the smallest
 // bucket ggml_qnn_pad_n(1) is used, because a weight capped even at that batch can never run
 // on the NPU and must be refused so that it lands in CPU_REPACK instead of a plain CPU buffer.
-// logs like the policy does: DEBUG once per shape, WARN for the first refusal of the process
+// logs like the policy does: DEBUG once per shape, and one stderr notice per process for the
+// first refusal at placement and one for the first at schedule time
 bool ggml_qnn_mul_mat_arith_reject(const struct ggml_tensor * op, bool placement_probe);
+
+// the static-weight budget at llama's weight-placement probe: true when the weight of this
+// MUL_MAT does not fit beside the weights the probe accepted before it. an accepted weight
+// leaves CPU_REPACK for a plain CPU buffer, and one the budget then refuses to bake runs on the
+// CPU without repack, at about half the speed (measured 2026-09-27).
+// the charge is the one a bake makes and the test is the one ggml_qnn_mul_mat_policy makes,
+// against the budget a session starts with (GGML_QNN_STATIC_BUDGET_MB, read per call, 0 = no
+// limit), so the placed weights fit together whatever order they bake in, as long as each
+// bakes once and nothing else is charged. three things break that and leave a placed weight
+// unbaked, on the CPU without repack: a second pad bucket (-ub over GGML_QNN_NPAD: each bucket
+// is its own bake and its own charge), a host weight this probe never saw (a layer llama
+// assigned to the CPU under a partial -ngl is still offered here by the scheduler, first in
+// graph order), and a device that clamps the session budget below this one
+// (ggml_qnn_budget_clamp; with 0 nothing is refused here at all).
+// a weight is charged once, keyed by name, type and shape: llama probes it again on a second
+// load, in the --fit dry run and in the graph of a no_alloc model.
+// the ledger is cleared when the last QNN backend of the process is freed and the session with
+// it (ggml_qnn_placement_reset): the device's buffer type is the CPU one
+// (ggml_backend_qnn_device_get_buffer_type), so the backend never sees a weight buffer freed.
+// models alive together share the ledger. what remains: two models loaded with no live context
+// between them are each placed up to the budget, and at schedule time the second one's bakes
+// are refused and its placed weights run on the CPU without repack. needs no session,
+// thread-safe
+bool ggml_qnn_placement_over_budget(const struct ggml_tensor * op);
+
+// clear the placement ledger, see ggml_qnn_placement_over_budget. the GGML_QNN_STATS counters
+// weights_placed and placement_budget_refused are process totals and are kept, as is the one
+// stderr notice
+void ggml_qnn_placement_reset(void);
 
 // GGML_QNN_QUANTIZED: the experimental per-execute dequant path for a quantized weight that
 // is not baked statically. read once

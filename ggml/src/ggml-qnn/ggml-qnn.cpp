@@ -59,7 +59,8 @@ static bool ggml_backend_qnn_session_lost(void) {
     return ggml_qnn_session_failed && ggml_qnn_session_worked;
 }
 
-static void ggml_backend_qnn_session_release(void) {
+// true when this release freed the session: the last ref went and the session was healthy
+static bool ggml_backend_qnn_session_release(void) {
     std::lock_guard<std::mutex> lock(ggml_qnn_session_mutex);
     GGML_ASSERT(ggml_qnn_session_refs > 0);
     if (--ggml_qnn_session_refs == 0) {
@@ -71,11 +72,13 @@ static void ggml_backend_qnn_session_release(void) {
             // every value, layered on top of whatever actually failed
             ggml_qnn_stats_write();
             GGML_LOG_WARN("ggml-qnn: keeping degraded session, NPU degraded, claiming no ops for the rest of this process\n");
-            return;
+            return false;
         }
         ggml_qnn_session_free(ggml_qnn_session_ptr);
         ggml_qnn_session_ptr = nullptr;
+        return true;
     }
+    return false;
 }
 
 // whether the shared session has degraded, or can no longer be created (the latch in acquire).
@@ -97,7 +100,13 @@ static const char * ggml_backend_qnn_get_name(ggml_backend_t backend) {
 static void ggml_backend_qnn_free(ggml_backend_t backend) {
     // a backend made after the session was lost holds no ref, see init_backend
     if (backend->context) {
-        ggml_backend_qnn_session_release();
+        // the placement ledger lives as long as the session, cleared from a backend's free and
+        // not from the ref supports_op takes and drops: under GGML_QNN_ELEMENTWISE the loader's
+        // probe of an ADD or MUL weight drops the last ref with no backend alive, in the middle
+        // of a model load, and that must not clear what the matmul probes before it placed
+        if (ggml_backend_qnn_session_release()) {
+            ggml_qnn_placement_reset();
+        }
     }
     delete backend;
 }
@@ -389,6 +398,10 @@ static bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const st
         // node's N is fictitious - see ggml_qnn_shape_denylisted
         if (ggml_backend_qnn_session_degraded() ||
             ggml_qnn_shape_denylisted(op, /*placement_probe=*/buf0 != nullptr)) {
+            return false;
+        }
+        // asked last: only a weight that nothing else refuses is charged to the budget
+        if (buf0 != nullptr && ggml_qnn_placement_over_budget(op)) {
             return false;
         }
         return true;

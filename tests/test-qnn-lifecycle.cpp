@@ -21,7 +21,10 @@
 //                                 cycle, clean exit
 //   test-qnn-lifecycle budget     a tiny budget refuses a weight as a policy reject and does
 //                                 NOT denylist it; committed bytes return on session free;
-//                                 a quantized weight is charged at its fp16 on-device size
+//                                 a quantized weight is charged at its fp16 on-device size.
+//                                 the same budget at llama's placement probe: named weights
+//                                 are placed until it is full and refused after, each
+//                                 charged once however often it is probed, 0 lifts it
 //   test-qnn-lifecycle denylist [noopt]  a seeded file (header line plus shape keys, the bytes
 //                                 the backend writes): a static-variant entry blocks that shape; a
 //                                 dynamic-variant entry does not block the static path; the
@@ -469,13 +472,17 @@ static bool probe_claim(ggml_backend_t backend, const mul_mat_case & c, bool tag
 
 // supports_op for a mul_mat whose tensors are unallocated (data == NULL). with_dummy hangs the
 // loader's zero-size dummy buffer of the device buffer type on the weight (a placement probe);
-// without it the weight is a graph tensor with no buffer at all, see scenario_loadprobe
-static bool probe_unallocated(ggml_backend_dev_t dev, const mul_mat_case & c, bool with_dummy) {
+// without it the weight is a graph tensor with no buffer at all, see scenario_loadprobe.
+// name is the tensor name a model weight carries, see check_placement_budget
+static bool probe_unallocated(ggml_backend_dev_t dev, const mul_mat_case & c, bool with_dummy, const char * name = nullptr) {
     ggml_init_params gp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(gp);
     ggml_tensor * w = ggml_new_tensor_2d(ctx, c.wtype, c.K, c.M);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.K, c.N);
     ggml_tensor * d = ggml_mul_mat(ctx, w, x);
+    if (name) {
+        ggml_set_name(w, name);
+    }
 
     ggml_backend_buffer_t dummy = with_dummy ? ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), 0) : nullptr;
     w->buffer = dummy;
@@ -687,6 +694,76 @@ static int scenario_basic(void) {
     return g_failures ? 1 : 0;
 }
 
+// the static budget at llama's placement probe (ggml_qnn_placement_over_budget): a weight the
+// budget will not bake must be refused at placement too, or it leaves CPU_REPACK for a matmul
+// that stays on the CPU. probes only: nothing is baked, and the session's committed bytes are
+// not part of this ledger. main sets the budget to 1 MiB and every weight placed below is
+// 64 KiB on the device (256x128 as fp16), so 16 fit. the tensor name is what makes two of them
+// distinct weights, as in a model
+static void check_placement_budget(ggml_backend_dev_t dev) {
+    const int64_t N = 512; // the batch llama's loader probes with
+    const mul_mat_case f16 = { GGML_TYPE_F16,  256, 128, N };
+    const mul_mat_case q4  = { GGML_TYPE_Q4_0, 256, 128, N };
+
+    // how many of the weights <prefix><first>.weight to <prefix><last>.weight are placed
+    auto placed = [dev](const mul_mat_case & c, const char * prefix, int first, int last) {
+        int n = 0;
+        for (int i = first; i <= last; i++) {
+            const std::string name = prefix + std::to_string(i) + ".weight";
+            n += probe_unallocated(dev, c, /*with_dummy=*/true, name.c_str()) ? 1 : 0;
+        }
+        return n;
+    };
+    char msg[224];
+
+    // refused by the IO cap, before the budget is asked: fp32 graph IO, 4096 * 64 * 4 = 1 MiB in
+    // at the smallest bucket, on the default cap. its 512 KiB would fit the budget and must not
+    // be charged to it, the 12 weights below fit beside 256 KiB at most
+    const mul_mat_case capped = { GGML_TYPE_F32, 4096, 32, N };
+    check(!probe_unallocated(dev, capped, /*with_dummy=*/true, "capped.weight"),
+          "placement: an F32 4096x32 weight is refused by the IO cap, 1 MiB of fp32 padded input");
+
+    int n = placed(q4, "q", 0, 3);
+    snprintf(msg, sizeof(msg), "placement: 4 Q4_0 weights are placed, 256 KiB of the budget (got %d)", n);
+    check(n == 4, msg);
+    n = placed(f16, "w", 0, 7);
+    snprintf(msg, sizeof(msg), "placement: 8 F16 weights are placed beside them, 768 KiB: the capped weight was not charged (got %d)", n);
+    check(n == 8, msg);
+
+    // probed again, as a second load, the --fit dry run and a no_alloc graph do
+    n = placed(q4, "q", 0, 3) + placed(f16, "w", 0, 7);
+    snprintf(msg, sizeof(msg), "placement: the 12 placed weights are accepted when probed again (got %d)", n);
+    check(n == 12, msg);
+
+    // 4 more reach the budget exactly, which still fits, like a bake at the budget does. none
+    // fits if the probes above were charged a second time
+    n = placed(f16, "w", 8, 11);
+    snprintf(msg, sizeof(msg), "placement: 4 more F16 weights fill the 1 MiB budget exactly, each weight charged once (got %d)", n);
+    check(n == 4, msg);
+    // two of these fit if the Q4_0 weights were charged their 18 KiB of nbytes
+    n = placed(f16, "w", 12, 15);
+    snprintf(msg, sizeof(msg), "placement: the next 4 are refused, the budget is full with the Q4_0 weights at their fp16 size (got %d placed)", n);
+    check(n == 0, msg);
+
+    // with the budget full a weight is known by its identity: the 12 placed ones still are,
+    // the 4 refused ones still are not
+    n = placed(f16, "w", 0, 15);
+    snprintf(msg, sizeof(msg), "placement: with the budget full, of 16 probed again the 12 placed ones are accepted (got %d)", n);
+    check(n == 12, msg);
+
+    // the name alone is not the identity: another shape under a placed name is a new weight
+    const mul_mat_case f16_half = { GGML_TYPE_F16, 256, 64, N };
+    check(!probe_unallocated(dev, f16_half, /*with_dummy=*/true, "w0.weight"),
+          "placement: a 256x64 weight under the name of a placed 256x128 one is a new weight, refused");
+
+    // 0 lifts the budget. it is read at every probe, like a session reads it at every init
+    set_env("GGML_QNN_STATIC_BUDGET_MB", "0");
+    n = placed(f16, "w", 12, 15);
+    set_env("GGML_QNN_STATIC_BUDGET_MB", "1");
+    snprintf(msg, sizeof(msg), "placement: GGML_QNN_STATIC_BUDGET_MB=0 places the 4 refused weights (got %d)", n);
+    check(n == 4, msg);
+}
+
 static int scenario_budget(void) {
     printf("scenario: budget\n");
     const char * dl = getenv("GGML_QNN_DENYLIST");
@@ -731,8 +808,21 @@ static int scenario_budget(void) {
     const int claims3 = count_claims(qnn, 20, GGML_TYPE_Q4_0);
     snprintf(msg, sizeof(msg), "Q4_0 budget charges the fp16 on-device size: 16/20 (got %d; 20 would mean nbytes accounting)", claims3);
     check(claims3 == 16, msg);
+
+    // before the last free, which writes the counters
+    ggml_backend_dev_t dev = ggml_backend_get_device(qnn);
+    check_placement_budget(dev);
     ggml_backend_free(qnn);
-    check_stat("weights_baked", 48, "the Q4_0 pass baked its 16 claims on top of the two f16 passes");
+    check_stat("weights_baked", 48, "the Q4_0 pass baked its 16 claims on top of the two f16 passes, the placement probes baked nothing");
+    check_stat("weights_placed", 20, "4 Q4_0 and 12 F16 weights placed under the budget and 4 with it lifted, each counted once");
+    check_stat("placement_budget_refused", 5, "the 4 F16 weights refused twice and the 256x64 one, each counted once, the capped weight not at all");
+
+    // that free was the last backend's and freed the session, which clears the ledger: the
+    // 256x64 weight the full ledger refused is placed now, under the same 1 MiB budget. the
+    // counters above were written at the free, before this probe
+    const mul_mat_case f16_half = { GGML_TYPE_F16, 256, 64, 512 };
+    check(probe_unallocated(dev, f16_half, /*with_dummy=*/true, "w0.weight"),
+          "placement: the ledger is cleared when the last backend frees the session, the refused 256x64 weight is placed");
 
     // file_size returns -1 absent and 0 empty; assert the file was never CREATED by any of
     // the policy rejects above, so that deleting denylist-writing entirely cannot make this
@@ -774,6 +864,7 @@ static int scenario_denylist_probe(void) {
           "an unseeded weight is still claimed at the same placement probe");
 
     ggml_backend_free(qnn);
+    check_stat("weights_placed", 1, "only the unseeded 256x64 weight; the denylisted one is not charged");
     return g_failures ? 1 : 0;
 }
 
@@ -1674,6 +1765,7 @@ static int scenario_fault(void) {
 
     check_stat("graphs_created", 1, "only the faulted graph was created");
     check_stat("weights_baked", 1, "its weight was baked before the injected failure");
+    check_stat("weights_placed", 0, "the degraded session refused the placement probe before the budget was asked");
     return g_failures ? 1 : 0;
 }
 
@@ -2361,9 +2453,16 @@ static int scenario_dyncache(void) {
     snprintf(m, sizeof(m), "new content at the same address is copied again and matches it (nmse %.2e)", ok ? nmse(ref_new, got) : -1.0);
     check(ok && nmse(ref_new, got) < 5e-4, m);
 
+    // llama's placement probe with the static bake off: nothing would be baked, so nothing is
+    // charged to the placement ledger, and the weight is still claimed for the dynamic path
+    ggml_backend_dev_t dev = ggml_backend_get_device(qnn);
+    check(probe_unallocated(dev, g_hook_a, /*with_dummy=*/true, "nostatic.weight"),
+          "the placement probe is claimed with GGML_QNN_NO_STATIC_WEIGHTS");
+
     held_free(h);
     ggml_backend_free(qnn);
 
+    check_stat("weights_placed", 0, "no ledger with GGML_QNN_NO_STATIC_WEIGHTS");
     check_stat("weights_baked", 0, "no static bake with GGML_QNN_NO_STATIC_WEIGHTS");
     check_stat("graphs_created", 1, "one dynamic graph: its key is the padded shape, no weight identity");
     check_stat("graph_cache_hits", 5, "the claim created the graph, each of the five computes found it");
@@ -2522,6 +2621,7 @@ int main(int argc, char ** argv) {
         set_env("GGML_QNN_DENYLIST", dl_path);
         set_env("GGML_QNN_NPAD", "64"); // keeps the over-budget probe's IO small, see the scenario
     } else if (mode == "denylist-probe") {
+        enable_stats();
         set_env("GGML_QNN_MIN_DIM", "1");
         set_env("GGML_QNN_DENYLIST", dl_path);
         // the bucket a -ub 32 run builds in, and the one ggml_qnn_pad_n(1) resolves to
