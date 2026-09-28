@@ -28,8 +28,14 @@ On that machine:
   they were meant to show are real and still in the code: a DCVS TURBO power config, and
   baking a weight once into the HTP-native layout instead of re-tiling it on every
   execute. What either is worth on an idle machine is an open question. The one throughput
-  figure that is claimed is the end-to-end model run at the foot of this list, and it is a
-  loss
+  figure that is claimed is the end-to-end model run at the foot of this list: with the
+  weight budget applied at placement, `-dev QNN` at the default budget is 7% faster on
+  prefill than the CPU alone in the same run and 12% faster than the CPU legs of the run
+  before it (2026-09-27, `-dev QNN -ub 512`, flash attention at `auto`, which resolves to on
+  in this tree, read from the code). On the build before that change, which placed every
+  probe-accepted weight for the NPU whatever the budget, the same protocol read a loss of
+  1.67-1.76x; both runs supersede the 2026-09-26 one (`-dev QNN -ub 32`, flash attention
+  disabled in the NPU legs and on in the CPU legs)
 - **47/47** `test-backend-ops` MUL_MAT correctness (F32/F16) against the CPU, run by ctest as
   `test-backend-ops-qnn`: 40 of 40 clean on an idle machine. A single 46/47 was seen once, in
   a run taken while other heavy work was loading the machine, and has not reproduced since on
@@ -57,9 +63,15 @@ On that machine:
   (`llama-bench` and `--fit` re-create it per context) falls back to the CPU instead of failing
   context creation
 - Quantized weights (Q4/Q5/...) enter the NPU path by being dequantized to fp16 once at bake
-  time, within a memory budget (default 1024 MB); one padded graph per weight serves every
+  time, within a memory budget (default 1024 MB) that is applied at placement as well: a
+  weight that does not fit beside those already placed keeps `CPU_REPACK`, and 0 lifts both
+  limits and places every weight, which on Qwen3-4B ran 1.8x slower than the default, so to
+  put more on the NPU set a number; one padded graph per weight serves every
   N up to `GGML_QNN_NPAD`, larger ubatches get one graph and bake per power-of-two bucket,
-  each charged to the budget, and buckets over the IO cap are refused. On a KleidiAI+REPACK
+  each charged to the budget, and buckets over the IO cap are refused, per ubatch: a weight
+  is placed by the smallest bucket, so at `-ub 1024` a weight 5120 or more wide (the
+  9728-wide FFN of Qwen3-4B) is placed for the NPU and runs on the CPU for every ubatch of
+  more than 512 tokens (arithmetic on the code, not a measurement). On a KleidiAI+REPACK
   build, K-quant weights reach the NPU with `-dev QNN`, the route every measurement here used
   (see the docs): since 2026-09-27 at the default `GGML_QNN_NPAD=512` and `-ub 512` for
   weights under 10240 wide, before that only with a `GGML_QNN_NPAD` small enough for the
@@ -91,44 +103,68 @@ On that machine:
   See the docs for the tuning guidance
 - Composes with the other backends in one binary: KleidiAI CPU + Adreno GPU (OpenCL) + NPU
 
-What it does not do (yet): beat a full-GPU or KleidiAI-CPU setup end to end - and that is
-now measured, not expected. The first NPU model run with proven placement (2026-09-26;
-`GGML_QNN_STATS` counters showing 41 weights on the NPU in each of llama-bench's two
-contexts, 3936 executes, none slow, slowest 1 ms; Qwen3-4B-Q4_K_M, `-dev QNN -ub 32`,
-`GGML_QNN_NPAD=32`, the fp16-IO fix in place) put
-prefill at 44-53 t/s against the same binary's CPU path at 101-114 t/s with its own
-`-ub 512` and 74-80 t/s handicapped to the NPU's `-ub 32`: that configuration is a net
-loss of about 2.2x on a dense quantized 4B model, about 1.6x against the handicapped CPU,
-and lifting the weight budget (68 weights on the NPU instead of 41) changed nothing (49.2
-against 48.4 t/s). It is a verdict on the configuration, not on the HTP alone: under
-`-dev QNN` the 211 (or 184) of 252 projections the budget left on the CPU ran without the
-`CPU_REPACK` (ggml's interleaved K-quant) layout the CPU-only legs had, and the run cannot
-separate that from the NPU slice's own cost. The NPU legs also ran with flash attention
-disabled and at `-ub 32`, the CPU legs with flash attention on: llama disabled it under
-`-dev QNN`, which is read from the code path, since `llama-bench` did not log it. Neither
-holds for today's code, and a re-measurement with flash attention on and `-ub 512` has not
-been run yet. CPU prefill was noisy that day (19-27% relative stddev within a
-leg, so 74-114 is a range, not a point) and the verdict survives the worst pairing at
-1.9x; the docs give the per-leg table and the caveats. The earlier 4B sweep's "NPU" leg
-never executed a matmul on the HTP, because the K-quant weights were repacked out of the
-NPU's reach and the one trial build stalled at the watchdog on the old mixed-dtype path
-(the docs carry the retraction, which stays), and 9-14B models are unmeasured. Decode is not claimed for the
-NPU below 32-token ubatches, so it runs on the CPU in every configuration - the 2026-09-26
-counters show no decode execute on the HTP - and on the settled-pack run the two measured
-engines (GPU, CPU) and the CPU-run leg labelled NPU converge on decode; CPU decode on this
-box is bimodal (about 24.7 or about 15.9 t/s at `-t 6`), so no decode figure is quoted.
+What it does not do (yet): beat a full-GPU setup end to end (the Adreno's 228.1 t/s stands
+unchallenged), and against a KleidiAI-CPU setup the gain is 7-12% on one model - measured,
+not expected. The current verdict is the second 2026-09-27 protocol run (on AC with a
+settled pack and a quiet machine, counterbalanced pairs of five repetitions, the
+`GGML_QNN_STATS` counters proving placement; Qwen3-4B-Q4_K_M at `-ub 512`, flash attention
+at `auto`, which resolves to on in this tree, read from the code), on the build where the
+weight budget is applied at placement. It put prefill at 135.2 and 139.2 t/s with `-dev QNN`
+at the default weight budget (41 weights on the NPU in each of llama-bench's two contexts,
+the other 211 in `CPU_REPACK`) against 128.4 for the same binary's CPU path alone in the same
+run, +7% (that run's other CPU leg was confounded by something else using the GPU and the
+CPU, and is excluded), and against 123.0 for the CPU legs of the first run that day, +12%,
+above the CPU alone rep for rep. `-dev QNN` with nothing on the NPU
+(`GGML_QNN_STATIC_BUDGET_MB=1`) reads what the CPU alone reads (127.9 and 129.6), and
+`GGML_QNN_STATIC_BUDGET_MB=0` reads 73.4 and 75.1, 1.8x slower than the default, because 0
+lifts the placement limit too: every weight leaves `CPU_REPACK`, the device takes 57 before
+it clamps and the other 195 run on the CPU without repack; to put more on the NPU, set a
+number. How much faster the NPU runs its own share is not measured, and neither is more
+weights than the default on this build. It is a verdict on the configuration and on this 4B
+model, not on the HTP alone. The first run that day, on the build that placed every
+probe-accepted weight for the NPU whatever the budget, read the same protocol as a loss:
+70.1 t/s at the default budget and 73.6 with the budget lifted against 123.0, 1.76x and
+1.67x slower, because placing a weight for the NPU cost it the `CPU_REPACK` (ggml's
+interleaved K-quant) layout whether or not the NPU then took it, which halved the CPU's
+prefill (`-dev QNN` with nothing on the NPU read 61.5, rep for rep what the CPU alone reads
+with `--repack 0`, 62.1). With 41 weights on the NPU the run was then 14% faster than that
+same placement run on the CPU, with 57 it was 20% faster, and with 41-57 of the 252
+projections on the NPU that did not make up for the ~200 the CPU ran without repack; the
+docs keep that run's table as the record of that build. The first NPU model run with proven
+placement (2026-09-26: 44-53 t/s against 101-114, about 2.2x, and about 1.6x against the CPU
+at the NPU's `-ub 32`) is superseded, because its NPU legs ran with flash attention disabled
+(llama disabled it under `-dev QNN`, which is fixed) and at the `-ub 32` that the 1 MiB cap
+of the time forced, while its CPU legs ran with flash attention on; the docs keep its table
+and give every run's caveats. The earlier 4B sweep's "NPU" leg never executed a matmul on
+the HTP, because the K-quant weights were repacked out of the NPU's reach and the one trial
+build stalled at the watchdog on the old mixed-dtype path (the docs carry the retraction,
+which stays), and 9-14B models are unmeasured. Decode is not claimed for the NPU below
+32-token ubatches, so it runs on the CPU in every configuration - the counters of every run
+show no decode execute on the HTP - and on the settled-pack run the two measured engines
+(GPU, CPU) and the CPU-run leg labelled NPU converge on decode; CPU decode on this box is
+bimodal, so no decode figure is quoted. In both 2026-09-27 protocol runs the `-dev QNN` legs
+started decode at 30-34 t/s and ended at 17-27 where the CPU-alone legs read 15-17
+throughout; that is not an NPU effect (the leg with nothing on the NPU reads the same), and
+its likely cause, the CPU clock recovering while the NPU session starts, is not proven.
 Its output against the CPU's was measured on 2026-09-27 (`llama-perplexity`, wikitext-2, 8
-chunks of 512, the same model, KL divergence from a CPU reference). The divergence first
-attributed to the NPU path (0.047 +- 0.025 on average, a maximum of 33.7-34.5, the top token
-different at about 3% of positions) was llama disabling flash attention under `-dev QNN`:
-with nothing on the NPU that configuration read 0.030 on average with a maximum of 34.3 and
-the same top token at 96.9%, to every digit what the CPU alone reads with `-fa off`. That is
-fixed, and the same run now reproduces the reference (0.000000, the same top token
-everywhere). With weights on the NPU the output still differs from the CPU's, by about what
-the CPU's own two attention paths differ by (a median of 0.0016-0.0018 against 0.0016); the
-mean and the maximum are set by a few unstable positions and do not rank configurations. So
+chunks of 512, the same model, KL divergence from a CPU reference). The first reading
+attributed the divergence to the NPU path against a control that also differed in flash
+attention, which llama disabled under `-dev QNN`: with nothing on the NPU that
+configuration read 0.030 on average with a maximum of 34.3 and the same top token at 96.9%,
+to every digit what the CPU alone reads with `-fa off`. That was a bug and is fixed, and the
+same run now reproduces the reference (0.000000, the same top token everywhere), so it
+explains the divergence when nothing is on the NPU. With weights on the NPU the output still
+differs from the CPU's (0.015-0.047 on average, a maximum of 20.3-34.9, the same top token
+at 96.5-97.3% over five placements; the budget-0 placements read 0.045-0.046 and 33.5-34.0
+with flash attention on, where the first reading had 0.047 and 33.7-34.5 with it disabled).
+The typical position differs by about what the CPU's own two attention paths differ by (a
+median of 0.0016-0.0018 against 0.0016).
+The mean and the maximum are set by a few positions that flip completely and do not rank
+configurations, but the placements with 43 or more weights on the NPU have three or more
+such positions of 2040 where the others have at most two, and that is not explained. So
 the runs do not show that the NPU path costs accuracy, and do not show that it equals the
-CPU; the docs have the table.
+CPU; the docs have the table. The placement change does not touch what the NPU computes,
+and the output was not re-measured after it.
 The case for fixing prefill with ahead-of-time compiled context binaries (a serialized
 context is reloaded instead of finalized again; the timings that sized that win have not
 been re-taken) is in [docs/backend/QNN.md](docs/backend/QNN.md).
