@@ -701,6 +701,32 @@ def test_anthropic_top_k():
     assert res.body["type"] == "message"
 
 
+def test_anthropic_min_p_presence_penalty():
+    """Test min_p and presence_penalty (llama.cpp specific) reach the sampler"""
+    server.server_slots = True
+    server.start()
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 8,
+        "min_p": 0.25,
+        "presence_penalty": 0.75,
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ]
+    })
+
+    assert res.status_code == 200
+    assert res.body["type"] == "message"
+
+    # the slot reports the params of the task it last ran
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    params = res.body[0]["params"]
+    assert params["min_p"] == pytest.approx(0.25)
+    assert params["presence_penalty"] == pytest.approx(0.75)
+
+
 # Error handling tests
 
 def test_anthropic_missing_messages():

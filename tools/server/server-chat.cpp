@@ -589,8 +589,10 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         oai_body["max_tokens"] = 4096;
     }
 
-    // Pass through common params
-    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs"}) {
+    // Pass through common params. min_p and presence_penalty are llama.cpp sampler
+    // params the Anthropic API does not define; left out of this list, a request
+    // that carries them runs at the server's launch values for both
+    for (const auto & key : {"temperature", "top_p", "top_k", "min_p", "presence_penalty", "stream", "chat_template_kwargs"}) {
         if (body.contains(key)) {
             oai_body[key] = body.at(key);
         }
