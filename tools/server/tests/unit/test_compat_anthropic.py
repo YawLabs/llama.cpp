@@ -727,6 +727,96 @@ def test_anthropic_min_p_presence_penalty():
     assert params["presence_penalty"] == pytest.approx(0.75)
 
 
+@pytest.mark.parametrize("field", ["min_p", "presence_penalty"])
+def test_anthropic_sampler_param_non_numeric_rejected(field):
+    """A non-numeric min_p / presence_penalty on /v1/messages is a 400 naming the field, and no task runs"""
+    server.server_slots = True
+    server.start()
+
+    # a valid task first, so the slot has a task id and params to compare against
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 8,
+        field: 0.5,
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ]
+    })
+    assert res.status_code == 200
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    id_task_before = res.body[0]["id_task"]
+    assert res.body[0]["params"][field] == pytest.approx(0.5)
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 8,
+        field: "0.25",
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ]
+    })
+
+    assert res.status_code == 400
+    assert res.body["error"]["type"] == "invalid_request_error"
+    assert res.body["error"]["code"] == 400
+    assert f"'{field}'" in res.body["error"]["message"]
+
+    # the slot still reports the earlier task: the rejected request never became one
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    assert res.body[0]["id_task"] == id_task_before
+    assert res.body[0]["params"][field] == pytest.approx(0.5)
+
+
+def test_anthropic_min_p_presence_penalty_null_uses_launch_defaults():
+    """min_p / presence_penalty sent as null on /v1/messages fall back to the server's launch values"""
+    server.server_slots = True
+    server.start()
+
+    res = server.make_request("GET", "/props")
+    assert res.status_code == 200
+    defaults = res.body["default_generation_settings"]["params"]
+    # the non-default values below must differ from the launch values, or the test proves nothing
+    assert defaults["min_p"] != pytest.approx(0.25)
+    assert defaults["presence_penalty"] != pytest.approx(0.75)
+
+    # a task with non-default values first, so the null task has something to overwrite
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 8,
+        "min_p": 0.25,
+        "presence_penalty": 0.75,
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ]
+    })
+    assert res.status_code == 200
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    id_task_before = res.body[0]["id_task"]
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 8,
+        "min_p": None,
+        "presence_penalty": None,
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ]
+    })
+
+    assert res.status_code == 200
+    assert res.body["type"] == "message"
+
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    assert res.body[0]["id_task"] != id_task_before
+    params = res.body[0]["params"]
+    assert params["min_p"] == pytest.approx(defaults["min_p"])
+    assert params["presence_penalty"] == pytest.approx(defaults["presence_penalty"])
+
+
 # Error handling tests
 
 def test_anthropic_missing_messages():
