@@ -41,11 +41,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 CLANG_DIR="${CLANG_DIR:-C:/Users/jeff/scoop/apps/llvm-arm64/current/bin}"
-QNN_SDK_ROOT="${QNN_SDK_ROOT:-C:/Users/jeff/yaw/genie-npu/qairt/2.45.0.260326}"
+# QAIRT SDK: absent as of 2026-10-15 (genie-npu and the sdk/qairt234 fallback were
+# deleted). Auto-discover whatever version is under ~/yaw/sdk/qairt/ so acquiring a new
+# one does not need an edit here; QNN_SDK_ROOT in the environment still wins.
+QNN_SDK_BASE="${QNN_SDK_BASE:-C:/Users/jeff/yaw/sdk/qairt}"
+QNN_SDK_ROOT="${QNN_SDK_ROOT:-}"
+if [ -z "$QNN_SDK_ROOT" ]; then
+    for d in "$QNN_SDK_BASE"/*/; do
+        [ -d "${d}include/QNN" ] || continue
+        QNN_SDK_ROOT="${d%/}"
+        break
+    done
+fi
 OPENCL_SDK="${OPENCL_SDK:-C:/Users/jeff/yaw/sdk}"
 # upstream CI gives its -L model tests Qwen3-0.6B. Not the stories15M test model: with it,
 # test-backend-sampler's logit-bias check fails (+10 on "World" does not win after "Hello")
-TEST_MODEL="${TEST_MODEL:-C:/Users/jeff/yaw/genie-npu/gguf/Qwen3-4B-Q4_K_M.gguf}"
+TEST_MODEL="${TEST_MODEL:-C:/Users/jeff/models/Qwen3-4B-Q4_K_M.gguf}"
 
 # Shared base. GGML_CPU_ARM_ARCH must stay quoted: PowerShell splits an unquoted -D value at
 # the dot and silently degrades the build to a bare armv8 baseline, which only shows up as
@@ -260,6 +271,20 @@ build_only || check run_editorconfig
 
 case "$mode" in
     npu|all)
+        # no SDK on the box as of 2026-10-15 (genie-npu + the sdk/qairt234 fallback were
+        # deleted): fail here with the fix rather than let cmake report a missing header
+        if [ ! -d "$QNN_SDK_ROOT" ]; then
+            if [ -n "$QNN_SDK_ROOT" ]; then
+                echo "error: QNN_SDK_ROOT does not exist: $QNN_SDK_ROOT" >&2
+            else
+                echo "error: no QAIRT SDK found (looked under $QNN_SDK_BASE)" >&2
+            fi
+            echo "  -DGGML_QNN=ON needs the QAIRT community SDK. It is absent as of 2026-10-15." >&2
+            echo "  Re-acquire it from the Qualcomm Software Center (login required; the old" >&2
+            echo "  direct-download URL 403s), extract to ~/yaw/sdk/qairt/<version>/, then either" >&2
+            echo "  set QNN_SDK_ROOT=<that path> here or pass it in the environment." >&2
+            exit 1
+        fi
         build_one "QNN / Hexagon NPU" build-npu \
             -DGGML_QNN=ON "-DQNN_SDK_ROOT=${QNN_SDK_ROOT}"
         if ! build_only; then
